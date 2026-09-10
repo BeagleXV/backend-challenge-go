@@ -33,6 +33,7 @@ Seis migrations versionadas em `migrations/` (golang-migrate, `NNNNNN_nome.up.sq
 | `000004` | `inbox_messages` | Dedup de mensagens SQS |
 | `000005` | `outbox_events` | Outbox transacional |
 | `000006` | role `wagering_runtime` | Privilégios mínimos de runtime |
+| `000007` | `wager_transactions.result_balance_*` | Snapshot do saldo no momento do processamento (ver seção 4) |
 
 **Toda invariante financeira é imposta no próprio Postgres, não só em Go** — cada uma foi testada manualmente (inserts/updates de violação, confirmando o erro esperado) antes de fechar a fase:
 
@@ -79,24 +80,45 @@ Todas as seis migrations foram validadas de ponta a ponta: `up` completo, `down 
 - **Origem interna vs. externa:** `NewExternal` rejeita explicitamente `KindOpening` (`ErrInvalidKind`) — `OPENING` só pode ser criado via `NewInternalOpening`, que não aceita nem preenche `providerID`, `externalTransactionID`, `idempotencyKey`, `payloadHash`, `roundID`, `gameID` ou referência (permanecem no valor zero, e a distinção de origem — `OriginInternal`/`OriginExternal` — é um campo próprio, mapeado para uma constraint de banco na fase de schema).
 - **Política de valor zero por tipo** (`validateAmountForKind`): `LOSS` exige exatamente `"0.00"`; `BET`, `WIN`, `REFUND` e `ROLLBACK` exigem valor estritamente positivo. `OPENING` aceita zero ou positivo (a decisão de não criar o registro quando o saldo inicial é zero fica a cargo do caso de uso, não do construtor de domínio).
 - **Reidratação:** `Rehydrate` reconstrói o estado exatamente como persistido, sem validar transições nem reemitir eventos — uma transação terminal reidratada continua terminal e continua rejeitando novas transições.
+- **`ResultBalance`:** campo adicionado retroativamente (migration `000007`) para persistir "o resultado financeiro retornado ao provedor" — o saldo da carteira observado no exato momento em que a transação chegou a `PROCESSED` ou `REJECTED`. `SetResultBalance` é chamado pelo caso de uso antes de cada uma dessas duas transições (nunca para `PENDING_REFERENCE`, que ainda não tem resultado financeiro). É esse snapshot, não o saldo atual da carteira, que um replay idempotente devolve (seção 7).
 
 ## 5. Reversões (REFUND / ROLLBACK)
 
 - `NewExternal` exige `referenceExternalTransactionID` para `REFUND`/`ROLLBACK` (`ErrReferenceRequired`) e rejeita esse campo para os demais tipos (`ErrReferenceNotApplicable`) — a validação é simétrica.
 - `ResolveReference` registra o id interno da transação referenciada e só é aplicável a `REFUND`/`ROLLBACK` (`ErrReferenceNotApplicable` para os demais tipos). Ele não altera o status por si só — a transição para `PROCESSED`/`REJECTED`/`FAILED` continua explícita, feita pelo caso de uso depois de validar a referência.
-- A prevenção de **dupla reversão bem-sucedida** da mesma referência (ex. dois REFUND processados sobre a mesma aposta) não é responsabilidade deste pacote — o domínio permite construir e resolver múltiplas tentativas; a garantia definitiva vem da constraint de unicidade no schema (Fase de schema/migrations) sobre `(reference_external_transaction_id, kind) WHERE status = 'PROCESSED'`, já que apenas o banco consegue arbitrar corretamente entre tentativas concorrentes.
+- A prevenção de **dupla reversão bem-sucedida** da mesma referência (ex. dois REFUND processados sobre a mesma aposta) não é responsabilidade deste pacote — o domínio permite construir e resolver múltiplas tentativas; a garantia definitiva vem da constraint de unicidade no schema (seção "Schema do banco de dados" acima) sobre `(reference_external_transaction_id, kind) WHERE status = 'PROCESSED'`, já que apenas o banco consegue arbitrar corretamente entre tentativas concorrentes.
+- A regra de negócio propriamente dita fica em `internal/application/processwagertransaction`, função `reversalDirection`: `REFUND` só é aceito referenciando um `BET` (crédito de volta); `ROLLBACK` desfaz um `BET` (crédito), ou um `WIN`/`REFUND` (débito) — nunca um `LOSS`, `OPENING` ou outro `ROLLBACK`. Qualquer outra combinação é rejeitada com `FailureCodeInvalidReferenceKind`.
+- A operação e sua referência precisam concordar em carteira, jogador, rodada e moeda (`validateReferenceAgreement`) — divergência rejeita com `FailureCodeReferenceMismatch`. O valor precisa ser exatamente igual ao da referência (`FailureCodeReferenceAmountMismatch`) — reversões parciais não existem.
+- Antes de aplicar o movimento, o caso de uso consulta `WagerTransactionRepository.HasSuccessfulReversal` (espelha a constraint do banco, mas devolve uma rejeição de negócio limpa em vez de deixar a violação de constraint SQL estourar) — uma segunda tentativa do mesmo tipo de reversão sobre a mesma referência é rejeitada com `FailureCodeReversalAlreadyProcessed`, **antes mesmo de tentar o movimento**.
+- `ROLLBACK` que precisaria debitar mais que o saldo disponível é rejeitado com `FailureCodeRollbackInsufficientBalance` — um código diferente do usado por um `BET` sem saldo (`FailureCodeInsufficientBalance`), como exigido.
+- Quando a referência existe mas terminou sem sucesso (`REJECTED`/`FAILED`), a reversão é rejeitada com `FailureCodeReferenceNotProcessed` — não tenta novamente e não fica pendente.
 
 ## 6. Referências pendentes
 
-*A ser detalhado: política de backoff exponencial, número máximo de tentativas ou TTL, códigos de falha.*
+Quando a referência de um `REFUND`/`ROLLBACK` ainda não existe, ou existe mas está `PENDING`/`PENDING_REFERENCE` (ainda não concluída), a operação é persistida como `PENDING_REFERENCE` e um evento `WagerTransactionPendingReference` é enfileirado na outbox — nunca fica bloqueando a transação SQL esperando a referência aparecer.
+
+A retomada (`processwagertransaction.Service.Resume`, exposta via `resolvependingreference.Service.Resolve`) reutiliza exatamente a mesma função de resolução de reversão (`applyReversal`) usada no caminho síncrono — não existe uma segunda implementação da regra "o que conta como resolvido". `resolvependingreference.Service.ListReady` expõe a consulta que localiza candidatos a retentativa.
+
+A política de backoff exponencial e TTL/número máximo de tentativas — quando desistir e transicionar para `REJECTED` com `FailureCodeReferenceNotFound` — é responsabilidade do worker dedicado (fase seguinte), que chama `Resolve` repetidamente; esta fase só entrega o mecanismo de resolução em si, não o agendamento.
 
 ## 7. Idempotência
 
-*A ser detalhado: algoritmo de hash canônico, campos incluídos/excluídos, equivalência de comportamento entre entrada HTTP e SQS.*
+O algoritmo de hash canônico do payload (serialização determinística, quais campos entram/saem) ainda será implementado numa fase própria — por ora, `Request.IdempotencyKey` e `Request.PayloadHash` chegam já calculados pelo chamador (HTTP/SQS).
+
+O que esta fase já implementa é o **uso** dessas informações para a detecção de conflito, igual para HTTP e SQS porque é o mesmo `processwagertransaction.Service.Handle` para ambos:
+
+- Busca por `idempotencyKey`: se existe e o hash bate, devolve o resultado persistido com `IdempotentReplay: true` — incluindo o **saldo observado no processamento original** (`WagerTransaction.ResultBalance`, seção 4), nunca o saldo atual da carteira, que pode ter mudado. Testado explicitamente: uma segunda operação move a carteira entre o processamento original e o replay, e o replay ainda devolve o saldo antigo.
+- Se existe e o hash diverge, retorna `ErrIdempotencyConflict`.
+- Busca por `(providerId, externalTransactionId)`: se já existe uma transação com uma `idempotencyKey` diferente da recebida, retorna `ErrExternalIDReused` — uma operação financeira não pode ser reaplicada sob outra chave.
+- Nenhuma dessas checagens depende de estado em memória do processo — tudo é lido do repositório a cada chamada.
 
 ## 8. Inbox / Outbox
 
-*A ser detalhado: garantias de atomicidade entre alteração de domínio, inbox e outbox; disputa entre múltiplos publishers; recuperação de trabalho abandonado.*
+Quando `Request.Inbox` é preenchido (entrada via SQS), `Handle` insere o registro de inbox (`(consumerName, messageId)`) na mesma `UnitOfWork` que tudo o mais. Se o registro já existe (reentrega), o processamento de domínio é pulado inteiramente e o resultado é obtido por busca de `idempotencyKey` — a mensagem nunca é reprocessada, e a resposta ainda assim reflete o resultado original. Para requisições HTTP, `Inbox` é `nil` e nada disso se aplica (a idempotência já cobre o caso HTTP sozinha).
+
+`MarkCompleted` é chamado ao final de toda transação bem-sucedida, **inclusive** quando o resultado é `PENDING_REFERENCE` — a pendência já está persistida de forma durável nesse ponto, então a mensagem de entrada pode ser considerada tratada; o worker de referências pendentes assume a continuidade a partir daí, sem depender da mensagem original.
+
+Todo evento de domínio (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged`, `WagerTransactionPendingReference`) é serializado em JSON e gravado via `OutboxRepository.Enqueue` **dentro da mesma transação** que a mudança que o originou — nunca publicado diretamente. A disputa entre múltiplos publishers e a recuperação de trabalho abandonado (`locked_by`/`locked_at`, já presentes no schema) ficam para o worker de outbox, numa fase própria.
 
 ## 9. Autenticação e autorização
 
