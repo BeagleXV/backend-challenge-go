@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
+      POSTGRES_USER: ${POSTGRES_USER:-wagering_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme-local-only}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-wagering_app} -d $${POSTGRES_DB:-wagering}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+# Keycloak, LocalStack e o serviço da aplicação entram nas fases correspondentes (6, 9, 17).
+
+volumes:
+  postgres_data:
