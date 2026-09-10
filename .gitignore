@@ -1,0 +1,12 @@
+/bin/
+/out/
+/api
+*.exe
+*.test
+*.out
+.env
+.env.local
+coverage.out
+coverage.html
+*.log
+.DS_Store
