@@ -68,6 +68,12 @@ type WagerTransactionRepository interface {
 	Insert(ctx context.Context, tx *wagertransaction.WagerTransaction) error
 	Update(ctx context.Context, tx *wagertransaction.WagerTransaction) error
 	GetByID(ctx context.Context, id uuid.UUID) (*wagertransaction.WagerTransaction, error)
+	// GetForUpdate locks the transaction row for the remainder of the
+	// current transaction. Required before resuming a PENDING_REFERENCE
+	// transaction (ports consumer: processwagertransaction.Service.Resume)
+	// — without it, two instances resolving the same pending transaction
+	// concurrently could both apply the reversal's movement.
+	GetForUpdate(ctx context.Context, id uuid.UUID) (*wagertransaction.WagerTransaction, error)
 	FindByIdempotencyKey(ctx context.Context, key string) (*wagertransaction.WagerTransaction, error)
 	FindByProviderAndExternalID(ctx context.Context, providerID, externalTransactionID string) (*wagertransaction.WagerTransaction, error)
 	// HasSuccessfulReversal reports whether a REFUND or ROLLBACK (per kind)
@@ -109,11 +115,31 @@ type InboxRepository interface {
 	MarkCompleted(ctx context.Context, consumerName, messageID string, completedAt time.Time) error
 }
 
+// OutboxRecord is a pending (or previously attempted) outbox row, as read
+// back by ClaimBatch.
+type OutboxRecord struct {
+	EventID     uuid.UUID
+	AggregateID uuid.UUID
+	EventType   string
+	Payload     []byte
+	OccurredAt  time.Time
+	Attempts    int
+}
+
 // OutboxRepository persists domain events for later publication by a
 // separate worker (Fase 11), in the same transaction as the domain change
 // that originated them. payload is the event's JSON-encoded snapshot.
 type OutboxRepository interface {
 	Enqueue(ctx context.Context, eventID, aggregateID uuid.UUID, eventType string, payload []byte, occurredAt time.Time) error
+	// ClaimBatch locks up to limit unpublished, due (next_attempt_at <= now)
+	// rows for the caller identified by lockedBy, for at most lockDuration
+	// before another publisher instance may claim them (recovering
+	// abandoned work). Must be called from within UnitOfWork.WithinTx.
+	ClaimBatch(ctx context.Context, limit int, lockedBy string, lockDuration time.Duration) ([]OutboxRecord, error)
+	// MarkPublished records successful delivery, preserving the eventId —
+	// republication after a crash between publish and this call must reuse
+	// the same eventId, never generate a new one.
+	MarkPublished(ctx context.Context, eventID uuid.UUID, publishedAt time.Time) error
 }
 
 // EventPublisher is the port the outbox worker (Fase 11) depends on to

@@ -192,6 +192,7 @@ type WagerTransactionRepository struct {
 	byID           map[uuid.UUID]*wagertransaction.WagerTransaction
 	byIdempotency  map[string]uuid.UUID
 	byProviderExtl map[string]uuid.UUID // "providerID|externalTransactionID"
+	rowLocks       map[uuid.UUID]*sync.Mutex
 }
 
 func NewWagerTransactionRepository() *WagerTransactionRepository {
@@ -199,7 +200,33 @@ func NewWagerTransactionRepository() *WagerTransactionRepository {
 		byID:           make(map[uuid.UUID]*wagertransaction.WagerTransaction),
 		byIdempotency:  make(map[string]uuid.UUID),
 		byProviderExtl: make(map[string]uuid.UUID),
+		rowLocks:       make(map[uuid.UUID]*sync.Mutex),
 	}
+}
+
+func (r *WagerTransactionRepository) rowLock(id uuid.UUID) *sync.Mutex {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.rowLocks[id]
+	if !ok {
+		m = &sync.Mutex{}
+		r.rowLocks[id] = m
+	}
+	return m
+}
+
+// GetForUpdate mirrors WalletRepository.GetForUpdate's lock lifecycle: held
+// until the current UnitOfWork.WithinTx call returns.
+func (r *WagerTransactionRepository) GetForUpdate(ctx context.Context, id uuid.UUID) (*wagertransaction.WagerTransaction, error) {
+	lock := r.rowLock(id)
+	lock.Lock()
+	reg, ok := ctx.Value(lockRegistryKey{}).(*lockRegistry)
+	if !ok {
+		lock.Unlock()
+		return nil, fmt.Errorf("apptest: GetForUpdate called outside WithinTx")
+	}
+	reg.add(lock)
+	return r.GetByID(ctx, id)
 }
 
 func providerExtKey(providerID, externalID string) string {
@@ -238,9 +265,26 @@ func cloneWagerTransaction(tx *wagertransaction.WagerTransaction) *wagertransact
 	return clone
 }
 
+// Insert mirrors the real schema's unique indexes: a colliding
+// idempotency_key or (providerID, externalTransactionID) is rejected with
+// ports.ErrAlreadyExists, exactly like the Postgres adapter's mapped
+// unique_violation — so use-case tests exercise the same conflict-retry
+// path the real database would trigger.
 func (r *WagerTransactionRepository) Insert(ctx context.Context, tx *wagertransaction.WagerTransaction) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if tx.IdempotencyKey() != "" {
+		if _, exists := r.byIdempotency[tx.IdempotencyKey()]; exists {
+			return fmt.Errorf("idempotency key %q: %w", tx.IdempotencyKey(), ports.ErrAlreadyExists)
+		}
+	}
+	if tx.ProviderID() != "" {
+		key := providerExtKey(tx.ProviderID(), tx.ExternalTransactionID())
+		if _, exists := r.byProviderExtl[key]; exists {
+			return fmt.Errorf("provider %q external id %q: %w", tx.ProviderID(), tx.ExternalTransactionID(), ports.ErrAlreadyExists)
+		}
+	}
+
 	r.byID[tx.ID()] = cloneWagerTransaction(tx)
 	if tx.IdempotencyKey() != "" {
 		r.byIdempotency[tx.IdempotencyKey()] = tx.ID()
@@ -398,6 +442,9 @@ type OutboxEvent struct {
 	EventType   string
 	Payload     []byte
 	OccurredAt  time.Time
+	Attempts    int
+	PublishedAt *time.Time
+	LockedBy    string
 }
 
 // OutboxRepository is an in-memory ports.OutboxRepository.
@@ -421,4 +468,42 @@ func (r *OutboxRepository) Enqueue(ctx context.Context, eventID, aggregateID uui
 		OccurredAt:  occurredAt,
 	})
 	return nil
+}
+
+func (r *OutboxRepository) ClaimBatch(ctx context.Context, limit int, lockedBy string, lockDuration time.Duration) ([]ports.OutboxRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []ports.OutboxRecord
+	for i := range r.Events {
+		e := &r.Events[i]
+		if e.PublishedAt != nil || e.LockedBy != "" {
+			continue
+		}
+		e.LockedBy = lockedBy
+		e.Attempts++
+		out = append(out, ports.OutboxRecord{
+			EventID:     e.EventID,
+			AggregateID: e.AggregateID,
+			EventType:   e.EventType,
+			Payload:     e.Payload,
+			OccurredAt:  e.OccurredAt,
+			Attempts:    e.Attempts,
+		})
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (r *OutboxRepository) MarkPublished(ctx context.Context, eventID uuid.UUID, publishedAt time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.Events {
+		if r.Events[i].EventID == eventID {
+			r.Events[i].PublishedAt = &publishedAt
+			return nil
+		}
+	}
+	return fmt.Errorf("outbox event %s: %w", eventID, ports.ErrNotFound)
 }

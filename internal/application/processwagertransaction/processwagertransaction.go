@@ -133,16 +133,37 @@ func validateRequest(req Request) error {
 	return nil
 }
 
+// errInsertConflict signals that Insert lost a race against a concurrent
+// identical submission. It must never be returned to a caller: once a
+// Postgres statement fails on a constraint violation, that transaction is
+// aborted and no further statement can run on it (including a lookup to
+// recover) — the only correct move is to let WithinTx roll the poisoned
+// transaction back and retry the whole operation fresh, in a brand new
+// transaction, where the winner's row is now visible.
+var errInsertConflict = errors.New("processwagertransaction: concurrent insert conflict")
+
 // Handle processes one external wager operation end to end: idempotency
 // checks, reference resolution when applicable, the financial rule for the
 // operation's kind, and persistence of the transaction, ledger entry (when
 // there is a movement), inbox record (when the request came from SQS) and
-// outbox events — all inside a single UnitOfWork.
+// outbox events — all inside a single UnitOfWork. On a concurrent-insert
+// conflict it retries once, in a fresh transaction; a second conflict is
+// not retried further, since Postgres only returns that error once the
+// winning transaction has already committed, so the retry's own lookups
+// are guaranteed to observe it.
 func (s *Service) Handle(ctx context.Context, req Request) (Result, error) {
 	if err := validateRequest(req); err != nil {
 		return Result{}, err
 	}
 
+	result, err := s.handleOnce(ctx, req)
+	if errors.Is(err, errInsertConflict) {
+		result, err = s.handleOnce(ctx, req)
+	}
+	return result, err
+}
+
+func (s *Service) handleOnce(ctx context.Context, req Request) (Result, error) {
 	var result Result
 	err := s.uow.WithinTx(ctx, func(ctx context.Context) error {
 		if req.Inbox != nil {
@@ -212,6 +233,13 @@ func (s *Service) Handle(ctx context.Context, req Request) (Result, error) {
 			return fmt.Errorf("construct wager transaction: %w", err)
 		}
 		if err := s.txs.Insert(ctx, tx); err != nil {
+			if errors.Is(err, ports.ErrAlreadyExists) {
+				// Lost a race against a concurrent identical submission
+				// that committed between our lookup above and this
+				// INSERT. Abort immediately — no further statement is
+				// safe on this transaction — and let Handle retry fresh.
+				return errInsertConflict
+			}
 			return fmt.Errorf("insert wager transaction: %w", err)
 		}
 
@@ -237,7 +265,10 @@ func (s *Service) Handle(ctx context.Context, req Request) (Result, error) {
 func (s *Service) Resume(ctx context.Context, transactionID uuid.UUID, correlationID string) (Result, error) {
 	var result Result
 	err := s.uow.WithinTx(ctx, func(ctx context.Context) error {
-		tx, err := s.txs.GetByID(ctx, transactionID)
+		// GetForUpdate, not GetByID: two instances resuming the same
+		// PENDING_REFERENCE transaction concurrently must serialize on
+		// this row, or both could apply the reversal's movement.
+		tx, err := s.txs.GetForUpdate(ctx, transactionID)
 		if err != nil {
 			return fmt.Errorf("load wager transaction: %w", err)
 		}

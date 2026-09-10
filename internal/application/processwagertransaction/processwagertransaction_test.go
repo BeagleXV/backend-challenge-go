@@ -481,3 +481,55 @@ func TestHandle_ConcurrentBets_MandatoryDisputeScenario(t *testing.T) {
 	require.Len(t, entries, 1, "exactly one ledger debit")
 	require.Equal(t, "80.00", entries[0].Amount().String())
 }
+
+// TestHandle_SameBetSentFiftyTimesInParallel_SingleDebit is the challenge's
+// other required concurrency test: the same bet submitted 50 times
+// concurrently must produce exactly one debit. All 50 calls share the same
+// idempotency key, so 49 of them race to lose either the pre-check lookup
+// or the INSERT itself (caught via ports.ErrAlreadyExists and turned into a
+// replay, see Handle).
+//
+// NoopUnitOfWork has no real transaction isolation (unlike real Postgres,
+// where a row is only ever visible to other transactions once fully
+// committed — by which point it is already PROCESSED, never a bare
+// PENDING), so a losing goroutine here can legitimately observe the
+// winner's row mid-flight and report an intermediate status. What must
+// hold regardless — and is asserted below — is the single financial
+// outcome: one ledger entry, one final balance, every response naming the
+// same transaction. The strict per-call PROCESSED guarantee is proven
+// against real Postgres transactions in the adapter integration test.
+func TestHandle_SameBetSentFiftyTimesInParallel_SingleDebit(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "1000.00")
+
+	req := baseRequest(walletID, wagertransaction.KindBet, "25.00")
+	req.Amount = mustMoney(t, "25.00")
+
+	const attempts = 50
+	results := make([]processwagertransaction.Result, attempts)
+	errs := make([]error, attempts)
+
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = h.svc.Handle(context.Background(), req)
+		}(i)
+	}
+	wg.Wait()
+
+	firstTransactionID := results[0].TransactionID
+	for i := range results {
+		require.NoError(t, errs[i])
+		require.Equal(t, firstTransactionID, results[i].TransactionID, "all 50 calls must resolve to the same transaction")
+	}
+
+	w, err := h.wallets.GetByID(context.Background(), walletID)
+	require.NoError(t, err)
+	require.Equal(t, "975.00", w.Balance().String())
+
+	entries, err := h.ledgers.ListByWallet(context.Background(), walletID)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "exactly one debit for 50 identical concurrent submissions")
+}
