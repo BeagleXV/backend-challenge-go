@@ -21,6 +21,31 @@ Decisões de arquitetura do serviço de processamento distribuído de apostas: r
 
 Organização de pacotes (arquitetura hexagonal): `internal/domain` contém as regras de negócio puras; `internal/application` orquestra o domínio através de interfaces (`ports`); `internal/adapters` implementa essas interfaces com bibliotecas concretas (Postgres, SQS, HTTP, IdP); `internal/fxmodules` é a única camada que conhece Fx.
 
+## Schema do banco de dados
+
+Seis migrations versionadas em `migrations/` (golang-migrate, `NNNNNN_nome.up.sql`/`.down.sql`), aplicadas via CLI/imagem Docker `migrate/migrate`, independente da versão de Go da aplicação:
+
+| Migration | Tabela/objeto | Papel |
+| --- | --- | --- |
+| `000001` | `wallets` | Agregado de carteira |
+| `000002` | `wager_transactions` | Operações (internas e externas) |
+| `000003` | `wallet_ledger_entries` | Ledger append-only |
+| `000004` | `inbox_messages` | Dedup de mensagens SQS |
+| `000005` | `outbox_events` | Outbox transacional |
+| `000006` | role `wagering_runtime` | Privilégios mínimos de runtime |
+
+**Toda invariante financeira é imposta no próprio Postgres, não só em Go** — cada uma foi testada manualmente (inserts/updates de violação, confirmando o erro esperado) antes de fechar a fase:
+
+- `wallets.balance >= 0` e `wallets.version >= 1` são `CHECK` constraints — uma tentativa de gravar saldo negativo é rejeitada pelo banco independentemente do código da aplicação.
+- `wager_transactions` tem um `CHECK` cruzado (`wager_transactions_origin_fields`) que impede qualquer linha `INTERNAL` de carregar metadados externos e qualquer linha `EXTERNAL` de faltar algum — a distinção `OPENING` vs. externo (seção 4) é garantida pelo schema, não só pelos dois construtores de domínio separados.
+- **Unicidade de idempotência**: índice único parcial em `idempotency_key` (só linhas `EXTERNAL`) e em `(provider_id, external_transaction_id)` — mesmo se a aplicação tivesse um bug de deduplicação, o banco rejeitaria a segunda tentativa.
+- **Crédito inicial duplicado**: índice único parcial `(wallet_id) WHERE kind = 'OPENING'` — testado inserindo uma segunda `OPENING` para a mesma carteira, rejeitada com `duplicate key`.
+- **Ledger imutável**: além de nenhuma coluna `updated_at`, um trigger (`wallet_ledger_entries_reject_mutation`) rejeita qualquer `UPDATE`/`DELETE` na tabela — testado diretamente via SQL, ambos falham com a mensagem do trigger. A consistência `balanceAfter = balanceBefore ± amount` é reforçada por `CHECK`, redundante com a validação já feita em `ledger.New` (Fase 1) — a mesma invariante é garantida duas vezes, em duas camadas independentes.
+- **Dupla reversão bem-sucedida**: índice único parcial `(provider_id, reference_external_transaction_id, kind) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')`. Testado: um segundo `REFUND` `PROCESSED` sobre a mesma referência é rejeitado; um `ROLLBACK` `PROCESSED` sobre a mesma referência *é* permitido (kind diferente) — a combinação REFUND+ROLLBACK sobre a mesma aposta não é bloqueada pelo schema, então a coerência financeira entre os dois (ex. impedir que a soma devolvida exceda o valor original) é responsabilidade da camada de aplicação (Fase de idempotência/casos de uso), não do banco.
+- **Role de runtime com privilégios mínimos** (`wagering_runtime`): `SELECT`/`INSERT`/`UPDATE` nas tabelas de domínio, mas **sem `UPDATE`/`DELETE` em `wallet_ledger_entries`** — reforço do trigger de imutabilidade numa camada diferente (privilégio de banco, não lógica). A role não tem senha própria versionada; ela é um "grupo de privilégios" (`NOLOGIN`), e o papel de login real que a aplicação usa é criado fora do controle de versão (provisionamento do ambiente), recebendo `GRANT wagering_runtime TO <role de login>`. Migrations sempre rodam como o dono do schema, nunca como essa role.
+
+Todas as seis migrations foram validadas de ponta a ponta: `up` completo, `down -all` completo (schema volta a conter só `schema_migrations`), e `up` reaplicado sem erro — confirmando que os `down.sql` são funcionais, não só existem.
+
 ## 1. Money
 
 `Money` (`internal/domain/money`) é um value object imutável: `int64` em unidades mínimas (centavos) mais `currency`. Nenhum `float32`/`float64` é usado em nenhuma etapa de parsing, aritmética ou serialização.
