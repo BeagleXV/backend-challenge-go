@@ -111,6 +111,13 @@ type WagerTransaction struct {
 	playerID uuid.UUID
 	amount   money.Money
 
+	// resultBalance is the wallet balance observed at the moment this
+	// transaction reached PROCESSED or REJECTED — the "resultado financeiro
+	// retornado ao provedor" the README requires persisting. nil until set.
+	// An idempotent replay must return this exact snapshot, never the
+	// wallet's current balance, which may have moved since.
+	resultBalance *money.Money
+
 	createdAt time.Time
 	updatedAt time.Time
 }
@@ -135,6 +142,24 @@ func (t *WagerTransaction) PlayerID() uuid.UUID            { return t.playerID }
 func (t *WagerTransaction) Amount() money.Money            { return t.amount }
 func (t *WagerTransaction) CreatedAt() time.Time           { return t.createdAt }
 func (t *WagerTransaction) UpdatedAt() time.Time           { return t.updatedAt }
+
+// ResultBalance returns the wallet balance snapshot recorded when this
+// transaction was finalized, and whether one was ever recorded (it never is
+// for a transaction still PENDING/PENDING_REFERENCE, or FAILED without a
+// financial outcome).
+func (t *WagerTransaction) ResultBalance() (money.Money, bool) {
+	if t.resultBalance == nil {
+		return money.Money{}, false
+	}
+	return *t.resultBalance, true
+}
+
+// SetResultBalance records the wallet balance to report back for this
+// transaction from now on, including on idempotent replay. Callers set this
+// once, right before transitioning to PROCESSED or REJECTED.
+func (t *WagerTransaction) SetResultBalance(balance money.Money) {
+	t.resultBalance = &balance
+}
 
 // validateAmountForKind enforces the zero-value policy per kind: LOSS
 // carries no movement and must be exactly "0.00"; BET, WIN, REFUND and
@@ -283,6 +308,7 @@ type RehydrateParams struct {
 	WalletID                       uuid.UUID
 	PlayerID                       uuid.UUID
 	Amount                         money.Money
+	ResultBalance                  *money.Money
 	CreatedAt                      time.Time
 	UpdatedAt                      time.Time
 }
@@ -310,6 +336,7 @@ func Rehydrate(p RehydrateParams) (*WagerTransaction, error) {
 		walletID:                       p.WalletID,
 		playerID:                       p.PlayerID,
 		amount:                         p.Amount,
+		resultBalance:                  p.ResultBalance,
 		createdAt:                      p.CreatedAt,
 		updatedAt:                      p.UpdatedAt,
 	}, nil

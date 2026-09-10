@@ -294,3 +294,40 @@ func TestRehydrate_PreservesTerminalStateWithoutValidation(t *testing.T) {
 	err = tx.MarkProcessed(time.Now())
 	require.Error(t, err)
 }
+
+func TestResultBalance_UnsetByDefault(t *testing.T) {
+	tx := newPendingTx(t)
+	_, ok := tx.ResultBalance()
+	require.False(t, ok)
+}
+
+func TestResultBalance_SetAndGet(t *testing.T) {
+	tx := newPendingTx(t)
+	balance := mustMoney(t, "975.00")
+	tx.SetResultBalance(balance)
+
+	got, ok := tx.ResultBalance()
+	require.True(t, ok)
+	require.True(t, balance.Equals(got))
+}
+
+func TestResultBalance_SurvivesRehydrate(t *testing.T) {
+	balance := mustMoney(t, "975.00")
+	tx, err := wagertransaction.Rehydrate(wagertransaction.RehydrateParams{
+		ID:            uuid.New(),
+		Origin:        wagertransaction.OriginExternal,
+		Kind:          wagertransaction.KindBet,
+		Status:        wagertransaction.StatusProcessed,
+		WalletID:      uuid.New(),
+		PlayerID:      uuid.New(),
+		Amount:        mustMoney(t, "25.00"),
+		ResultBalance: &balance,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	})
+	require.NoError(t, err)
+
+	got, ok := tx.ResultBalance()
+	require.True(t, ok)
+	require.True(t, balance.Equals(got))
+}
