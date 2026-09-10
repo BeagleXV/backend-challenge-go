@@ -69,7 +69,30 @@ Todas as seis migrations foram validadas de ponta a ponta: `up` completo, `down 
 
 ## 3. Transações SQL
 
-*A ser detalhado na fase de adapters Postgres: delimitação exata de onde cada transação começa/termina, por caso de uso.*
+`internal/adapters/postgres.UnitOfWork` implementa `ports.UnitOfWork` com uma transação pgx real: `WithinTx` abre a transação, injeta o `pgx.Tx` no `context.Context` (chave de pacote privada, `txKey`), executa a função do caso de uso, e comita ou reverte de acordo com o retorno — exatamente um `BEGIN`/`COMMIT` por chamada de caso de uso. Cada repositório resolve, via `q(ctx, pool)`, se deve executar contra a transação ativa ou (quando chamado fora de qualquer `WithinTx`, ex. um `GET` HTTP simples) diretamente contra o pool — os dois tipos satisfazem a mesma interface estrutural `querier` (`Exec`/`Query`/`QueryRow`).
+
+**Delimitação por caso de uso:**
+
+| Caso de uso | O que entra na mesma transação |
+| --- | --- |
+| `OpenWallet.Handle` | Insert da carteira; se saldo inicial > 0: insert do `OPENING`, insert do lançamento de crédito, update do `OPENING` para `PROCESSED`, insert dos dois eventos na outbox. |
+| `ProcessWagerTransaction.Handle` | Insert opcional na inbox (SQS) → lookups de idempotência → `SELECT ... FOR UPDATE` da carteira → insert da `wager_transaction` → mutação da carteira + lançamento no ledger + update da transação para o estado final + eventos na outbox → conclusão da inbox. |
+| `ProcessWagerTransaction.Resume` | `SELECT ... FOR UPDATE` da própria `wager_transaction` pendente → `SELECT ... FOR UPDATE` da carteira → mesmo caminho de resolução de reversão do `Handle`. |
+| `Reconciliation.Reconcile` | Leitura da carteira + leitura de todos os lançamentos do ledger, sem nenhuma escrita. |
+
+**Locks pessimistas implementados:**
+- `WalletRepository.GetForUpdate`: `SELECT ... FOR UPDATE` na linha da carteira. Validado com dois goroutines, cada um com sua própria transação contra o mesmo pool (conexões de servidor genuinamente distintas) disputando um débito de 80 num saldo de 100 — exatamente um sucede, o outro observa o saldo já reduzido ao obter o lock.
+- `WagerTransactionRepository.GetForUpdate`: mesmo princípio, na linha da própria `wager_transaction`, usado por `Resume` — necessário porque duas instâncias do worker de referências pendentes (fase futura) podem tentar resolver a mesma transação `PENDING_REFERENCE` ao mesmo tempo; sem esse lock, ambas poderiam aplicar o movimento da reversão.
+- `WagerTransactionRepository.ListPendingReferenceForUpdate` e `OutboxRepository.ClaimBatch`: `SELECT ... FOR UPDATE SKIP LOCKED`, para que múltiplas instâncias concorrentes dividam o trabalho sem bloquear umas às outras.
+
+**Duas race conditions reais encontradas ao ligar isso a um Postgres de verdade** (nenhuma das duas era visível contra os fakes em memória da Fase 3, que não replicam isolamento de transação):
+
+1. **Retomada de referência pendente sem lock de linha próprio.** A primeira versão de `Resume` usava `GetByID` (sem lock) para carregar a `wager_transaction`. Duas instâncias retomando a mesma transação `PENDING_REFERENCE` simultaneamente serializavam no lock da carteira, mas não na leitura inicial — a segunda podia carregar o objeto em memória antes da primeira commitar, e depois aplicar o movimento uma segunda vez sobre um saldo já atualizado. Corrigido trocando para `GetForUpdate` (ver acima).
+2. **Abort de transação após violação de constraint.** A primeira versão, ao perder a corrida de `INSERT` por `idempotency_key`/`(providerId, externalId)` duplicado, tentava consultar a linha vencedora *na mesma transação* para devolver o resultado como replay. No Postgres real isso nunca funciona: depois que uma instrução viola uma constraint, a transação inteira fica abortada e qualquer comando seguinte falha com `current transaction is aborted` até o `ROLLBACK`. A correção: `Insert` retorna um erro sentinela (`errInsertConflict`) que aborta a transação imediatamente (sem tentar mais nada nela), e `Handle` repete a operação inteira **numa transação nova** — a segunda tentativa sempre encontra a linha vencedora já commitada, porque o Postgres só libera o `INSERT` perdedor com erro depois que a transação vencedora termina. Uma única repetição é suficiente (nunca mais que isso é necessário, pela mesma razão).
+
+Esse segundo ponto foi provado com um teste de integração que envia a mesma aposta 50 vezes em paralelo contra Postgres real (`TestProcessWagerTransaction_SameBetSentFiftyTimesInParallel_SingleDebit`): todas as 50 chamadas retornam `PROCESSED`, com o mesmo `transactionId` e o mesmo saldo — nunca um estado intermediário, porque nenhuma transação concorrente consegue observar a linha vencedora antes dela commitar por inteiro.
+
+**Mapeamento de erros** (`internal/adapters/postgres/errors.go`): toda função de repositório passa o erro cru do pgx por `mapErr`, que traduz `pgx.ErrNoRows` → `ports.ErrNotFound`, `unique_violation` (23505) → `ports.ErrAlreadyExists`, e `check_violation`/`not_null_violation`/`foreign_key_violation` → `ErrConstraintViolation` (sentinela própria do pacote `postgres`, usada quando a violação indica um bug ou uma race não prevista pela aplicação, não uma entrada de negócio recusável). Nenhum `*pgconn.PgError` ou `pgx.ErrNoRows` cru escapa desse pacote para a camada de aplicação.
 
 ## 4. Máquina de estados de WagerTransaction
 
