@@ -39,13 +39,15 @@ func New(uow ports.UnitOfWork, wallets ports.WalletRepository, ledgers ports.Led
 // storedBalance - calculatedBalance, per the contract.
 //
 // Both reads must observe the same consistent snapshot for the comparison
-// to be meaningful under concurrent writes. UnitOfWork alone does not
-// guarantee that under Postgres's default READ COMMITTED isolation — the
-// concrete adapter (Fase 4/12) must run this specific use case inside a
-// REPEATABLE READ (or stricter) transaction.
+// to be meaningful under concurrent writes — WithinRepeatableReadTx (not
+// the plain WithinTx every other use case in this codebase uses) is what
+// guarantees that: without it, a concurrent BET/WIN/etc. committing
+// between the wallet read and the ledger read could make an otherwise
+// perfectly consistent wallet look divergent, purely from an artifact of
+// timing.
 func (s *Service) Reconcile(ctx context.Context, walletID uuid.UUID) (Result, error) {
 	var result Result
-	err := s.uow.WithinTx(ctx, func(ctx context.Context) error {
+	err := s.uow.WithinRepeatableReadTx(ctx, func(ctx context.Context) error {
 		w, err := s.wallets.GetByID(ctx, walletID)
 		if err != nil {
 			return fmt.Errorf("load wallet: %w", err)

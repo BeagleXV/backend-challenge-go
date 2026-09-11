@@ -81,6 +81,16 @@ func (NoopUnitOfWork) WithinTx(ctx context.Context, fn func(ctx context.Context)
 	return fn(ctx)
 }
 
+// WithinRepeatableReadTx has nothing extra to provide here — the in-memory
+// repositories have no isolation levels to begin with — so it's the same
+// as WithinTx. The REPEATABLE READ guarantee itself is real Postgres
+// behavior, proved against a real database
+// (postgres_integration_test.go), not something a fake could
+// meaningfully simulate.
+func (u NoopUnitOfWork) WithinRepeatableReadTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	return u.WithinTx(ctx, fn)
+}
+
 // WalletRepository is an in-memory ports.WalletRepository.
 type WalletRepository struct {
 	mu       sync.Mutex

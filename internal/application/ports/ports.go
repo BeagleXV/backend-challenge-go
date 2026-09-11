@@ -43,6 +43,17 @@ type IDGenerator interface {
 // library type.
 type UnitOfWork interface {
 	WithinTx(ctx context.Context, fn func(ctx context.Context) error) error
+	// WithinRepeatableReadTx behaves like WithinTx, except the transaction
+	// is read-only and begins at the REPEATABLE READ isolation level: every
+	// statement fn runs sees the same snapshot, taken at the first
+	// statement, regardless of commits by other transactions in between.
+	// Reconciliation (the only caller) needs this specifically — two reads
+	// (wallet balance, then the full ledger) that each ran against
+	// whatever was newest at the time, under the default READ COMMITTED
+	// level, could observe a concurrent write in between the two and
+	// report a spurious difference for a wallet that was never actually
+	// inconsistent.
+	WithinRepeatableReadTx(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
 // WalletRepository persists and retrieves wallets.
