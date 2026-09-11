@@ -93,6 +93,38 @@ func TestNew_RejectsInvalidDirection(t *testing.T) {
 	require.True(t, errors.Is(err, ledger.ErrInvalidEntry))
 }
 
+func TestNew_RejectsCurrencyMismatch(t *testing.T) {
+	usd, err := money.New("30.00", money.USD)
+	require.NoError(t, err)
+
+	_, err = ledger.New(ledger.NewParams{
+		ID:            uuid.New(),
+		WalletID:      uuid.New(),
+		TransactionID: uuid.New(),
+		Direction:     ledger.DirectionDebit,
+		Amount:        usd,
+		BalanceBefore: mustMoney(t, "100.00"),
+		BalanceAfter:  mustMoney(t, "70.00"),
+		CreatedAt:     time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ledger.ErrInvalidEntry))
+}
+
+func TestNew_RequiresCreatedAt(t *testing.T) {
+	_, err := ledger.New(ledger.NewParams{
+		ID:            uuid.New(),
+		WalletID:      uuid.New(),
+		TransactionID: uuid.New(),
+		Direction:     ledger.DirectionDebit,
+		Amount:        mustMoney(t, "30.00"),
+		BalanceBefore: mustMoney(t, "100.00"),
+		BalanceAfter:  mustMoney(t, "70.00"),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ledger.ErrInvalidEntry))
+}
+
 func TestNew_RequiresIdentifiers(t *testing.T) {
 	_, err := ledger.New(ledger.NewParams{
 		WalletID:      uuid.New(),
