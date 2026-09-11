@@ -126,14 +126,19 @@ A política de backoff exponencial e TTL/número máximo de tentativas — quand
 
 ## 7. Idempotência
 
-O algoritmo de hash canônico do payload (serialização determinística, quais campos entram/saem) ainda será implementado numa fase própria — por ora, `Request.IdempotencyKey` e `Request.PayloadHash` chegam já calculados pelo chamador (HTTP/SQS).
+**`CanonicalHash` (`internal/application/processwagertransaction/canonicalhash.go`):** SHA-256 sobre o JSON de uma struct fixa, `canonicalPayload`, com exatamente estes campos, nesta ordem — `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `amount`, `currency`, `referenceExternalTransactionId`. `encoding/json` sempre serializa os campos de uma struct na ordem declarada (nunca reordena, nunca depende de iteração de mapa), então essa struct fixa **é** o "JSON canônico com ordenação de chaves" que o desafio pede — não há um passo separado de ordenar chaves porque não existe um mapa para ordenar.
 
-O que esta fase já implementa é o **uso** dessas informações para a detecção de conflito, igual para HTTP e SQS porque é o mesmo `processwagertransaction.Service.Handle` para ambos:
+**Excluídos deliberadamente:** `idempotencyKey` (é a chave de busca, não faz parte do que ela identifica — incluí-la faria cada chave hashear para si mesma, trivializando a comparação), `correlationId` e metadados do inbox (`Inbox.ConsumerName/MessageID/Hash`) — observabilidade/transporte, nunca dado de negócio. Testado explicitamente em `TestCanonicalHash_IgnoresTransportMetadata`.
 
-- Busca por `idempotencyKey`: se existe e o hash bate, devolve o resultado persistido com `IdempotentReplay: true` — incluindo o **saldo observado no processamento original** (`WagerTransaction.ResultBalance`, seção 4), nunca o saldo atual da carteira, que pode ter mudado. Testado explicitamente: uma segunda operação move a carteira entre o processamento original e o replay, e o replay ainda devolve o saldo antigo.
-- Se existe e o hash diverge, retorna `ErrIdempotencyConflict`.
-- Busca por `(providerId, externalTransactionId)`: se já existe uma transação com uma `idempotencyKey` diferente da recebida, retorna `ErrExternalIDReused` — uma operação financeira não pode ser reaplicada sob outra chave.
-- Nenhuma dessas checagens depende de estado em memória do processo — tudo é lido do repositório a cada chamada.
+**Normalização do valor monetário:** `amount` entra no hash como `money.Money.String()` — a forma decimal de duas casas fixas que `money.New` já produz ao converter qualquer entrada aceita (`"25"` e `"25.00"` são o mesmo `Money`, logo o mesmo hash). Essa normalização acontece no parsing (`money.Money.UnmarshalJSON`), antes de `Request` sequer existir — não há normalização adicional a fazer no cálculo do hash em si. Testado em `TestCanonicalHash_NormalizesEquivalentAmountForms`.
+
+**Onde o hash é calculado — e por que não é um campo de `Request`:** diferente da implementação interina da Fase 6 (que calculava o hash em `internal/adapters/httpapi` e o passava como `Request.PayloadHash`), `Handle` agora chama `CanonicalHash(req)` internamente, a partir dos próprios campos de negócio de `Request`. Isso elimina uma classe inteira de bug: nenhum chamador (HTTP ou o consumidor SQS da Fase 9) pode calcular o hash errado, esquecer de normalizar, ou divergir de como o outro transporte calcula — há exatamente um lugar que decide o que "a mesma operação" significa, e os dois transportes o compartilham por construção, não por convenção. `Request` não tem mais campo `PayloadHash`.
+
+**Fluxo de decisão em `Handle`/`handleOnce`** (já existente desde a Fase 3, agora alimentado pelo hash canônico): busca por `idempotencyKey`; se existe e `existing.PayloadHash() == hash` → devolve o resultado persistido com `IdempotentReplay: true`, incluindo o **saldo observado no processamento original** (`WagerTransaction.ResultBalance`, seção 4), nunca o saldo atual da carteira, que pode ter mudado — testado explicitamente: uma segunda operação move a carteira entre o processamento original e o replay, e o replay ainda devolve o saldo antigo; se existe e o hash diverge → `ErrIdempotencyConflict` (409); se não existe, busca por `(providerId, externalTransactionId)` — se já existe sob outra `idempotencyKey` → `ErrExternalIDReused` (409), impedindo reaplicar a mesma operação financeira com uma chave diferente.
+
+**Equivalência HTTP/SQS:** ambos os transportes normalizam sua entrada para o mesmo `processwagertransaction.Request` (que já contém todo campo que entra no hash) e chamam `Handle` — não há lógica de idempotência ou hashing duplicada em `internal/adapters/httpapi` nem, quando existir, em `internal/adapters/sqsconsumer`.
+
+**Persistência:** nenhuma dessas checagens depende de estado em memória do processo — tudo é lido do repositório a cada chamada, então múltiplas instâncias e reinícios não afetam a garantia.
 
 ## 8. Inbox / Outbox
 
