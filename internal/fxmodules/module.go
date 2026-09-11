@@ -20,6 +20,13 @@ func All(cfg *config.Config) []fx.Option {
 		PostgresModule,
 		ApplicationModule,
 		IDPModule,
+		// SQSConsumerModule is listed before HTTPAPIModule so its OnStart
+		// hook is appended first: fx runs OnStop in reverse order, so on
+		// shutdown the HTTP listener stops accepting new requests before
+		// the SQS consumer stops pulling new messages, matching the
+		// README's documented order (HTTP listener → workers →
+		// connections) rather than an arbitrary one.
+		SQSConsumerModule,
 		HTTPAPIModule,
 		BootstrapModule,
 		fx.StopTimeout(cfg.ShutdownTimeout),

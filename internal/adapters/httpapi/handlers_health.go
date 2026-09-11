@@ -5,15 +5,19 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type healthHandlers struct {
-	pool *pgxpool.Pool
+	pool          *pgxpool.Pool
+	sqsClient     *sqs.Client
+	wagerQueueURL string
 }
 
-func newHealthHandlers(pool *pgxpool.Pool) *healthHandlers {
-	return &healthHandlers{pool: pool}
+func newHealthHandlers(pool *pgxpool.Pool, sqsClient *sqs.Client, wagerQueueURL string) *healthHandlers {
+	return &healthHandlers{pool: pool, sqsClient: sqsClient, wagerQueueURL: wagerQueueURL}
 }
 
 // liveHandler only reports that the process is up and serving — it never
@@ -23,8 +27,7 @@ func (h *healthHandlers) liveHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // readyHandler reports whether the process's dependencies are actually
-// reachable — a real ping, never a hardcoded 200. SQS readiness joins this
-// once Fase 9 adds an SQS client to check.
+// reachable — a real check against each one, never a hardcoded 200.
 func (h *healthHandlers) readyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
@@ -37,6 +40,15 @@ func (h *healthHandlers) readyHandler(w http.ResponseWriter, r *http.Request) {
 		ready = false
 	} else {
 		checks["postgres"] = "ok"
+	}
+
+	if _, err := h.sqsClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl: aws.String(h.wagerQueueURL),
+	}); err != nil {
+		checks["sqs"] = "unavailable"
+		ready = false
+	} else {
+		checks["sqs"] = "ok"
 	}
 
 	status := http.StatusOK

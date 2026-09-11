@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,6 +20,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/ports"
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/application/reconciliation"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/config"
 )
 
 // NewRouter assembles every route in the contract. Health checks are
@@ -28,6 +30,8 @@ import (
 func NewRouter(
 	verifier *idp.Verifier,
 	pool *pgxpool.Pool,
+	sqsClient *sqs.Client,
+	cfg *config.Config,
 	openWallet *openwallet.Service,
 	processor *processwagertransaction.Service,
 	reconcile *reconciliation.Service,
@@ -42,7 +46,7 @@ func NewRouter(
 	r.Use(correlationIDMiddleware(func() string { return uuid.New().String() }))
 	r.Use(loggingMiddleware(logger))
 
-	health := newHealthHandlers(pool)
+	health := newHealthHandlers(pool, sqsClient, cfg.SQS.WagerTransactionsQueueURL)
 	r.Get("/health/live", health.liveHandler)
 	r.Get("/health/ready", health.readyHandler)
 
