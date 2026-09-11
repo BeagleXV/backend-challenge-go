@@ -6,6 +6,7 @@ package apptest
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -390,7 +391,53 @@ func (r *LedgerRepository) ListByWallet(ctx context.Context, walletID uuid.UUID)
 			out = append(out, e)
 		}
 	}
+	sortLedgerEntries(out)
 	return out, nil
+}
+
+func (r *LedgerRepository) ListByWalletPage(ctx context.Context, walletID uuid.UUID, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]*ledger.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var matching []*ledger.Entry
+	for _, e := range r.entries {
+		if e.WalletID() == walletID {
+			matching = append(matching, e)
+		}
+	}
+	sortLedgerEntries(matching)
+
+	var out []*ledger.Entry
+	for _, e := range matching {
+		if !afterLedgerKey(e, afterCreatedAt, afterID) {
+			continue
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func sortLedgerEntries(entries []*ledger.Entry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].CreatedAt().Equal(entries[j].CreatedAt()) {
+			return entries[i].ID().String() < entries[j].ID().String()
+		}
+		return entries[i].CreatedAt().Before(entries[j].CreatedAt())
+	})
+}
+
+// afterLedgerKey reports whether e sorts strictly after the (createdAt, id)
+// keyset position, mirroring the Postgres adapter's tuple comparison.
+func afterLedgerKey(e *ledger.Entry, afterCreatedAt time.Time, afterID uuid.UUID) bool {
+	if e.CreatedAt().After(afterCreatedAt) {
+		return true
+	}
+	if e.CreatedAt().Before(afterCreatedAt) {
+		return false
+	}
+	return e.ID().String() > afterID.String()
 }
 
 // InboxRepository is an in-memory ports.InboxRepository.

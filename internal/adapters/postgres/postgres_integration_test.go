@@ -205,6 +205,77 @@ func TestLedgerRepository_ImmutableAtDatabaseLevel(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestLedgerRepository_ListByWalletPage_KeysetPaginationOverRealRows proves
+// the (created_at, id) keyset comparison the HTTP ledger endpoint (Fase 6)
+// relies on actually works against Postgres's own ordering and tuple
+// comparison — the in-memory fake's equivalent logic is exercised by unit
+// tests, but only a real query can prove the SQL is correct.
+func TestLedgerRepository_ListByWalletPage_KeysetPaginationOverRealRows(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	uow := postgres.NewUnitOfWork(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	txs := postgres.NewWagerTransactionRepository(pool)
+	ledgers := postgres.NewLedgerRepository(pool)
+
+	walletID := insertWallet(t, ctx, uow, wallets, "1000.00")
+
+	openingTx, err := wagertransaction.NewInternalOpening(wagertransaction.NewInternalOpeningParams{
+		ID: uuid.New(), WalletID: walletID, PlayerID: uuid.New(), Amount: mustMoney(t, "1000.00"), Now: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Insert(ctx, openingTx) }))
+
+	// Five entries, each against its own BET transaction (the unique
+	// constraint on (wallet_id, transaction_id) forbids reusing one) and
+	// each carrying a distinct, increasing balance so their relative
+	// order after paging is easy to assert.
+	const total = 5
+	before := mustMoney(t, "1000.00")
+	for i := 0; i < total; i++ {
+		betTx, err := wagertransaction.NewExternal(wagertransaction.NewExternalParams{
+			ID: uuid.New(), ProviderID: "provider-a", ExternalTransactionID: fmt.Sprintf("tx-%d", i),
+			IdempotencyKey: fmt.Sprintf("provider-a:tx-%d", i), PayloadHash: fmt.Sprintf("hash-%d", i),
+			WalletID: walletID, PlayerID: uuid.New(), RoundID: "round-1", GameID: "game-1",
+			Kind: wagertransaction.KindBet, Amount: mustMoney(t, "100.00"), Now: time.Now().UTC(),
+		})
+		require.NoError(t, err)
+		require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Insert(ctx, betTx) }))
+
+		after := mustMoney(t, fmt.Sprintf("%d.00", 1000-(i+1)*100))
+		entry, err := ledger.New(ledger.NewParams{
+			ID: uuid.New(), WalletID: walletID, TransactionID: betTx.ID(),
+			Direction: ledger.DirectionDebit, Amount: mustMoney(t, "100.00"),
+			BalanceBefore: before, BalanceAfter: after,
+			CreatedAt: time.Now().UTC(),
+		})
+		require.NoError(t, err)
+		require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return ledgers.Append(ctx, entry) }))
+		before = after
+	}
+
+	var (
+		afterCreatedAt time.Time
+		afterID        uuid.UUID
+		seen           []string
+	)
+	for {
+		page, err := ledgers.ListByWalletPage(ctx, walletID, afterCreatedAt, afterID, 2)
+		require.NoError(t, err)
+		if len(page) == 0 {
+			break
+		}
+		for _, e := range page {
+			seen = append(seen, e.BalanceAfter().String())
+		}
+		last := page[len(page)-1]
+		afterCreatedAt = last.CreatedAt()
+		afterID = last.ID()
+	}
+
+	require.Equal(t, []string{"900.00", "800.00", "700.00", "600.00", "500.00"}, seen)
+}
+
 func TestInboxRepository_ConcurrentSameMessage_OnlyOneWins(t *testing.T) {
 	pool := testDB(t)
 	ctx := context.Background()

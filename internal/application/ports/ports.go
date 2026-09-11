@@ -91,7 +91,18 @@ type WagerTransactionRepository interface {
 // LedgerRepository appends and reads ledger entries.
 type LedgerRepository interface {
 	Append(ctx context.Context, entry *ledger.Entry) error
+	// ListByWallet returns every entry for walletID, oldest first. Used by
+	// reconciliation, which needs the full history to recompute a balance —
+	// never by an HTTP handler, which must page (see ListByWalletPage).
 	ListByWallet(ctx context.Context, walletID uuid.UUID) ([]*ledger.Entry, error)
+	// ListByWalletPage returns up to limit entries for walletID ordered by
+	// (createdAt, id) ascending — a stable tie-break for entries created
+	// within the same timestamp tick — starting strictly after the
+	// (afterCreatedAt, afterID) keyset position. Pass the zero time.Time and
+	// uuid.Nil for the first page: both sort below any real entry. The HTTP
+	// handler (Fase 6) is the only caller, and owns turning this keyset into
+	// the contract's opaque cursor.
+	ListByWalletPage(ctx context.Context, walletID uuid.UUID, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]*ledger.Entry, error)
 }
 
 // InboxMessage identifies a single inbound message for durable

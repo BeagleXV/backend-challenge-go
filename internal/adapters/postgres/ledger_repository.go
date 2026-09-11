@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/beaglexv/backend-challenge-go/internal/domain/ledger"
@@ -44,14 +45,33 @@ func (r *LedgerRepository) ListByWallet(ctx context.Context, walletID uuid.UUID)
 		`SELECT id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at
 		 FROM wallet_ledger_entries
 		 WHERE wallet_id = $1
-		 ORDER BY created_at`,
+		 ORDER BY created_at, id`,
 		walletID,
 	)
 	if err != nil {
 		return nil, mapErr(err, "ledger.ListByWallet")
 	}
 	defer rows.Close()
+	return scanLedgerEntries(rows, "ledger.ListByWallet")
+}
 
+func (r *LedgerRepository) ListByWalletPage(ctx context.Context, walletID uuid.UUID, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]*ledger.Entry, error) {
+	rows, err := q(ctx, r.pool).Query(ctx,
+		`SELECT id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at
+		 FROM wallet_ledger_entries
+		 WHERE wallet_id = $1 AND (created_at, id) > ($2, $3)
+		 ORDER BY created_at, id
+		 LIMIT $4`,
+		walletID, afterCreatedAt, afterID, limit,
+	)
+	if err != nil {
+		return nil, mapErr(err, "ledger.ListByWalletPage")
+	}
+	defer rows.Close()
+	return scanLedgerEntries(rows, "ledger.ListByWalletPage")
+}
+
+func scanLedgerEntries(rows pgx.Rows, opName string) ([]*ledger.Entry, error) {
 	var out []*ledger.Entry
 	for rows.Next() {
 		var (
@@ -61,7 +81,7 @@ func (r *LedgerRepository) ListByWallet(ctx context.Context, walletID uuid.UUID)
 			createdAt                      time.Time
 		)
 		if err := rows.Scan(&id, &walletRowID, &transactionID, &direction, &amount, &currency, &before, &after, &createdAt); err != nil {
-			return nil, mapErr(err, "ledger.ListByWallet")
+			return nil, mapErr(err, opName)
 		}
 
 		cur := money.Currency(currency)
@@ -94,7 +114,7 @@ func (r *LedgerRepository) ListByWallet(ctx context.Context, walletID uuid.UUID)
 		out = append(out, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, mapErr(err, "ledger.ListByWallet")
+		return nil, mapErr(err, opName)
 	}
 	return out, nil
 }
