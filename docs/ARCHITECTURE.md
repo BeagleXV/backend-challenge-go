@@ -285,7 +285,45 @@ Domínio (`internal/domain/**`) confirmado sem nenhum import de `go.uber.org/fx`
 
 ## 14. Observabilidade
 
-*A ser detalhado: o que é logado, quais métricas existem e o que cada uma mede.*
+### Logs
+
+JSON estruturado (`zap`), nível e formato (console em `local`/`dev`, JSON em produção) definidos em `internal/platform/logging`. Toda linha de log carrega o que estiver disponível entre `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId` — nunca todos ao mesmo tempo (nem sempre fazem sentido juntos), mas nunca omitidos quando o dado existe naquele ponto do código: `wagering_submit_processed` (HTTP), `sqsconsumer: processed wager transaction`, `referenceworker: attempted pending reference resolution`/`expired pending reference`, `reconciliation_divergence`, `outboxpublisher: published event` (este último carrega `eventId`, não há `walletId`/`providerId` na outbox — o payload do evento é quem carrega isso, não a linha de log do publisher).
+
+**O que deliberadamente nunca é logado:** o header `Authorization` ou o token em si (`internal/adapters/httpapi/middleware.go`'s `loggingMiddleware` só grava método, path, status, duração e `correlationId` — nunca lê o corpo da requisição nem os headers); o corpo completo de uma requisição ou de uma mensagem SQS (só campos extraídos e IDs); segredos/credenciais (nunca aparecem em código-fonte nem em log — vêm só de `config`, e `config` nunca é logado por inteiro, campo a campo apenas quando necessário para diagnóstico, e mesmo assim nunca senha/secret). `playerId` aparece em alguns payloads de evento (não em log — eventos vão para a outbox/SQS, não para o log), mas nunca como *label* de métrica (ver abaixo). Verificado com grep dedicado antes de fechar a fase: nenhuma ocorrência de `token`, `password`, `secret`, `authorization` ou `payload`/`body` em qualquer chamada `zap.*` do código de produção.
+
+### Métricas (OpenTelemetry Metrics SDK + exporter Prometheus)
+
+`internal/platform/metrics`: `Provider` monta o `MeterProvider` do OTel com o exporter `go.opentelemetry.io/otel/exporters/prometheus` registrado num `prometheus.Registry` próprio, exposto via `promhttp.HandlerFor`. Não há push nem loop de coleta em background — o exporter é pull-based, e todo instrumento assíncrono (gauge) só executa seu callback quando algo de fato faz scrape em `/metrics`, então um valor como "idade do evento mais antigo pendente na outbox" está sempre tão atual quanto o último scrape, nunca desatualizado por um timer que ficou para trás.
+
+`/metrics` roda num **listener HTTP separado**, `cfg.MetricsAddr` (padrão `:9090`), não no mesmo servidor da API de negócio (`cfg.HTTPAddr`) — pode ser vinculado a uma interface privada ou isolado por firewall sem tocar na porta pública, e um handler de negócio travado nunca consegue bloquear um scrape (não compartilham listener nem goroutine).
+
+**Instrumentos, e por quê:**
+
+| Métrica | Tipo | Labels | O que mede |
+| --- | --- | --- | --- |
+| `wagering_transactions_total` | counter | `status`, `transport` (`http`\|`sqs`\|`worker`) | Contagem por status de operação, por ponto de entrada |
+| `idempotent_replays_total` | counter | `transport` | Duplicatas detectadas (resultado devolvido sem reprocessar) |
+| `retries_total` | counter | `kind` (`sqs_message`\|`pending_reference`\|`outbox_publish`) | Retentativas nos três mecanismos independentes de retry do sistema |
+| `dlq_messages` | gauge (observável) | — | Mensagens atualmente na DLQ (`SQS_WAGER_TRANSACTIONS_DLQ_URL`, via `GetQueueAttributes` no momento do scrape) |
+| `concurrency_conflicts_total` | counter | `reason` (`idempotency_conflict`\|`external_id_reused`\|`pending_reference_race`) | Duas chamadas disputando a mesma operação, uma perdendo com segurança |
+| `outbox_oldest_pending_age_seconds` | gauge (observável) | — | Atraso da outbox: idade do evento não publicado mais antigo; ausente (não zero) quando a outbox está vazia |
+| `wagering_processing_duration_seconds` | histograma | `transport` | Latência de processamento de uma operação, do início ao fim da chamada a `Handle`/`Resume`/`Expire` |
+| `reconciliation_divergences_total` | counter | — | Divergências encontradas pela reconciliação (Fase 12) |
+
+**Por que `insert_conflict` (a corrida de INSERT que `processwagertransaction.Handle` já resolve retentando uma vez, internamente) não vira métrica:** é absorvida inteiramente dentro de `Handle`, nunca escapa para quem chama — não há como um `httpapi`/`sqsconsumer` observá-la de fora sem injetar uma dependência de métricas na camada de aplicação pura, o que este projeto evita deliberadamente (domínio e aplicação continuam livres de qualquer import de infraestrutura, inclusive observabilidade — só os adapters em `internal/adapters/*` e `internal/fxmodules` conhecem `*metrics.Metrics`). Documentado aqui como uma lacuna consciente, não um esquecimento.
+
+**Cardinalidade dos labels:** todo label usado (`status`, `transport`, `kind`, `reason`) é um conjunto pequeno e fixo de valores conhecidos em tempo de compilação — nunca `playerId`, `walletId`, `transactionId` ou `externalTransactionId`, que são ilimitados e explodiriam a cardinalidade de séries do Prometheus. Esses identificadores vivem nos logs (onde cardinalidade não é um problema da mesma forma), nunca em label de métrica.
+
+**`metrics.NewNoop()`:** toda a suíte de testes deste projeto (SQS consumer, worker de referências, worker de outbox, handlers HTTP) usa um `*Metrics` de verdade construído contra o `noop.MeterProvider` do próprio OTel, nunca um ponteiro nulo verificado manualmente em cada `Record*` — um bug de wiring real (fx não injetando `*Metrics`) continua estourando alto (nil pointer) em vez de silenciosamente não gravar nada.
+
+**`/health/ready`** (Fase 9) já reflete o estado real de Postgres e SQS via checagem de verdade a cada requisição — nunca um `200 OK` fixo; ver seção 10.
+
+**Tracing (diferencial opcional, não implementado):** a mesma inicialização do OTel SDK (`internal/platform/metrics`) fica pronta para isso sem refatoração — adicionar tracing seria só um segundo `TracerProvider` + exporter ao lado do que já existe aqui, reaproveitando o mesmo `context.Context` que já circula por toda a aplicação.
+
+**Testado:**
+- Unitário (`internal/platform/metrics/metrics_test.go`): cada instrumento aparece no scrape com o valor e os labels esperados; o gauge da outbox fica ausente (não zero) quando não há evento pendente.
+- Integração (`internal/adapters/postgres/postgres_integration_test.go`): `OldestUnpublishedOccurredAt` contra Postgres real — drenado, um evento, dois eventos (relata o mais antigo independente da ordem de inserção), publicar o mais antigo revela o próximo.
+- Manual, processo real (`docker compose up`, ver histórico de sessão): `dlq_messages` no scrape inicial já reflete a fila real do LocalStack (`0`); após abrir carteira + `BET` rejeitado por saldo insuficiente + replay idempotente, o scrape seguinte mostra `wagering_transactions_total{status="REJECTED",transport="http"} 2`, `idempotent_replays_total{transport="http"} 1` e o histograma de latência populado; `SIGTERM` mantém `/metrics` de pé depois que todos os workers já pararam, parando só depois do pool Postgres — dá para observar o próprio desligamento até quase o fim.
 
 ## 15. Limitações e trabalho não concluído
 
