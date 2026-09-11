@@ -117,6 +117,20 @@ migrate -path migrations -database "$DATABASE_URL" down 1  # reverte uma migrati
 
 No Docker Compose isso é automático (serviço `migrate`). Todas as 9 já foram validadas de ponta a ponta: `up` completo, `down` completo (schema volta a só ter `schema_migrations`), `up` reaplicado sem erro.
 
+## Documentação da API (Swagger/OpenAPI)
+
+O contrato HTTP completo está em [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.0 — rotas, schemas de request/response, códigos de erro e o esquema de autenticação). Para navegar num Swagger UI local:
+
+```sh
+docker compose --profile docs up -d swagger-ui
+```
+
+Abra `http://localhost:8082`. É só documentação — o serviço fica atrás do profile `docs` (nunca sobe com `docker compose up` simples) e não faz parte da imagem da aplicação.
+
+```sh
+docker compose --profile docs down   # derrubar só o swagger-ui
+```
+
 ## Exemplos de chamadas (curl)
 
 Com um token de `internal-service` em `$TOKEN` (veja acima) e a API em `http://localhost:8080`:

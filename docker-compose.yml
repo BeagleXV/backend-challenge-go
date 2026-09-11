@@ -125,6 +125,19 @@ services:
     profiles: ["tools"]
     entrypoint: ["sh"]
 
+  # Swagger UI for docs/openapi.yaml — documentation only, never started by
+  # a plain `up` (profile "docs") and not part of the running application
+  # or its image. `docker compose --profile docs up swagger-ui`.
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.17.14
+    profiles: ["docs"]
+    environment:
+      SWAGGER_JSON: /openapi.yaml
+    volumes:
+      - ./docs/openapi.yaml:/openapi.yaml:ro
+    ports:
+      - "127.0.0.1:8082:8080"
+
 volumes:
   postgres_data:
   localstack_data:

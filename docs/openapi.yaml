@@ -1,0 +1,452 @@
+openapi: 3.0.3
+info:
+  title: Processamento Distribuído de Apostas — API
+  description: |
+    Contrato HTTP do serviço de processamento de apostas. Ver `README.md` para
+    como rodar a stack e obter um token de teste, e `ARCHITECTURE.md` para as
+    decisões por trás de cada garantia (idempotência, concorrência, outbox).
+
+    Toda rota de negócio exige `Authorization: Bearer <token>` (OAuth2
+    `client_credentials` via Keycloak). Rotas de carteira exigem a claim
+    `internal: true` (só o client `internal-service`); rotas de operação
+    exigem `providerId` e só permitem acesso aos próprios dados do provedor
+    autenticado — tentar ler/escrever em nome de outro provedor retorna `403`
+    (corpo divergente) ou `404` (recurso de outro provedor, para não revelar
+    se ele existe).
+  version: "1.0"
+servers:
+  - url: http://localhost:8080
+    description: docker compose local (ou `go run ./cmd/api` local)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: wallets
+    description: Carteiras e ledger — acesso restrito ao serviço interno
+  - name: wagering
+    description: Operações de apostas (BET/WIN/LOSS/REFUND/ROLLBACK) — acesso restrito ao provedor dono da operação
+  - name: health
+    description: Health checks públicos, sem autenticação
+
+paths:
+  /wallets:
+    post:
+      tags: [wallets]
+      summary: Abrir uma carteira
+      operationId: openWallet
+      description: |
+        Cria uma carteira para `(playerId, currency)`. Saldo inicial positivo
+        também cria a transação interna `OPENING` (PROCESSED), seu lançamento
+        de crédito no ledger e os eventos de outbox `WagerTransactionProcessed`
+        + `WalletBalanceChanged`, tudo no mesmo commit. Saldo inicial zero não
+        cria nada disso além da carteira. Uma segunda carteira para o mesmo
+        `(playerId, currency)` é rejeitada com `409`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenWalletRequest"
+            example:
+              playerId: 0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1
+              initialBalance: { amount: "1000.00", currency: "BRL" }
+      responses:
+        "201":
+          description: Carteira criada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wallet" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: Já existe carteira para este `(playerId, currency)`
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /wallets/{walletId}:
+    get:
+      tags: [wallets]
+      summary: Consultar uma carteira
+      operationId: getWallet
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WalletID"
+      responses:
+        "200":
+          description: Carteira encontrada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wallet" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /wallets/{walletId}/ledger:
+    get:
+      tags: [wallets]
+      summary: Listar lançamentos do ledger (paginação por cursor)
+      operationId: listLedger
+      description: |
+        Paginação real por keyset sobre `(created_at, id)`, nunca `OFFSET` —
+        estável sob escrita concorrente. `cursor` é opaco: sempre o
+        `nextCursor` de uma resposta anterior, nunca construído manualmente.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WalletID"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Cursor opaco (base64) devolvido em `nextCursor` de uma página anterior
+      responses:
+        "200":
+          description: Página de lançamentos
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LedgerPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /wallets/{walletId}/reconciliation:
+    post:
+      tags: [wallets]
+      summary: Reconciliar saldo armazenado vs. reconstruído do ledger
+      operationId: reconcileWallet
+      description: |
+        Operação somente leitura (roda em REPEATABLE READ para um snapshot
+        consistente entre as duas leituras) — nunca corrige o saldo, só
+        reporta. Uma divergência é logada (`reconciliation_divergence`) e
+        conta na métrica `reconciliation_divergences_total`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WalletID"
+      responses:
+        "200":
+          description: Resultado da reconciliação (consistente ou não)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reconciliation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /wagering/transactions:
+    post:
+      tags: [wagering]
+      summary: Submeter uma operação (BET/WIN/LOSS/REFUND/ROLLBACK)
+      operationId: submitWagerTransaction
+      description: |
+        Idempotente por `Idempotency-Key` (header obrigatório): mesma chave e
+        mesmo corpo devolve o resultado original (`idempotentReplay: true`,
+        inclusive o saldo observado no processamento original, não o saldo
+        atual); mesma chave com corpo diferente retorna `409`. O mesmo
+        `(providerId, externalTransactionId)` não pode ser reaplicado sob
+        outra chave (`409`). O mesmo `Handle` processa operações chegando por
+        SQS — o resultado é idêntico entre os dois transportes.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+          example: "provider-a:transaction-123"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WagerTransactionRequest"
+            example:
+              providerId: provider-a
+              externalTransactionId: transaction-123
+              playerId: 0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1
+              walletId: 0192f291-27dd-7d3f-8071-5f8685deef37
+              roundId: round-987
+              gameId: fortune-chimp
+              kind: BET
+              money: { amount: "25.00", currency: "BRL" }
+      responses:
+        "200":
+          description: "Processada com sucesso (`status: PROCESSED`)"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WagerTransactionResult" }
+        "202":
+          description: Referência ainda não chegou — persistida como `PENDING_REFERENCE`, retomada depois pelo worker de referências pendentes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WagerTransactionResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Conflito de idempotência (mesma chave, payload diferente) ou `(providerId, externalTransactionId)` já processado sob outra chave
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: "Rejeitada por regra de negócio (`status: REJECTED`, ver `failureCode`) — ex. saldo insuficiente, referência não encontrada, moeda incompatível"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WagerTransactionResult" }
+
+  /wagering/transactions/{transactionId}:
+    get:
+      tags: [wagering]
+      summary: Consultar uma operação pelo id interno
+      operationId: getWagerTransactionById
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Operação encontrada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WagerTransactionDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /providers/{providerId}/wagering/transactions/{externalTransactionId}:
+    get:
+      tags: [wagering]
+      summary: Consultar uma operação pela chave natural do provedor
+      operationId: getWagerTransactionByProviderAndExternalId
+      description: |
+        `providerId` no path deve ser o mesmo do token autenticado — divergência
+        retorna `404`, nunca `403`, para não revelar se a transação de outro
+        provedor existe.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: externalTransactionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Operação encontrada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WagerTransactionDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /health/live:
+    get:
+      tags: [health]
+      summary: Liveness — o processo está de pé
+      operationId: getLiveness
+      security: []
+      description: Nunca toca uma dependência; sempre `200` enquanto o processo existir.
+      responses:
+        "200":
+          description: Processo vivo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { status: { type: string, example: ok } }
+
+  /health/ready:
+    get:
+      tags: [health]
+      summary: Readiness — Postgres e SQS respondem de verdade
+      operationId: getReadiness
+      security: []
+      responses:
+        "200":
+          description: Todas as dependências respondem
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: Ao menos uma dependência não responde
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Token OAuth2 `client_credentials` emitido pelo Keycloak do realm
+        `wagering`. Ver `README.md` para como obter um token de teste.
+
+  parameters:
+    WalletID:
+      name: walletId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Corpo/parâmetros inválidos
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Token ausente, malformado, expirado ou com assinatura/issuer/audiência inválidos
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Autenticado, mas sem a claim/escopo exigido pela rota (ex. `providerId` do corpo diferente do token)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Recurso não encontrado (inclusive um recurso de outro provedor — nunca distinguível de "não existe")
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          description: Decimal de escala fixa (2 casas), nunca ponto flutuante
+          example: "25.00"
+        currency:
+          type: string
+          enum: [BRL, USD, EUR]
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: INVALID_REQUEST }
+            message: { type: string }
+
+    OpenWalletRequest:
+      type: object
+      required: [playerId, initialBalance]
+      properties:
+        playerId: { type: string, format: uuid }
+        initialBalance: { $ref: "#/components/schemas/Money" }
+
+    Wallet:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        playerId: { type: string, format: uuid }
+        balance: { $ref: "#/components/schemas/Money" }
+        version: { type: integer, format: int64 }
+
+    LedgerEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        walletId: { type: string, format: uuid }
+        transactionId: { type: string, format: uuid }
+        direction: { type: string, enum: [DEBIT, CREDIT] }
+        amount: { $ref: "#/components/schemas/Money" }
+        balanceBefore: { $ref: "#/components/schemas/Money" }
+        balanceAfter: { $ref: "#/components/schemas/Money" }
+        createdAt: { type: string, format: date-time }
+
+    LedgerPage:
+      type: object
+      properties:
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/LedgerEntry" }
+        nextCursor:
+          type: string
+          description: Presente só quando há mais páginas
+
+    Reconciliation:
+      type: object
+      properties:
+        walletId: { type: string, format: uuid }
+        storedBalance: { $ref: "#/components/schemas/Money" }
+        calculatedBalance: { $ref: "#/components/schemas/Money" }
+        difference: { $ref: "#/components/schemas/Money" }
+        consistent: { type: boolean }
+        checkedEntries: { type: integer }
+
+    WagerTransactionRequest:
+      type: object
+      required: [providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money]
+      properties:
+        providerId: { type: string }
+        externalTransactionId: { type: string }
+        playerId: { type: string, format: uuid }
+        walletId: { type: string, format: uuid }
+        roundId: { type: string }
+        gameId: { type: string }
+        kind: { type: string, enum: [BET, WIN, LOSS, REFUND, ROLLBACK] }
+        money: { $ref: "#/components/schemas/Money" }
+        referenceExternalTransactionId:
+          type: string
+          description: Obrigatório para `REFUND`/`ROLLBACK`; proibido para os demais
+
+    WagerTransactionResult:
+      type: object
+      properties:
+        transactionId: { type: string, format: uuid }
+        status: { type: string, enum: [PROCESSED, PENDING_REFERENCE, REJECTED] }
+        balance: { $ref: "#/components/schemas/Money" }
+        idempotentReplay: { type: boolean }
+        failureCode:
+          type: string
+          description: Presente quando `status = REJECTED`
+
+    WagerTransactionDetail:
+      type: object
+      properties:
+        transactionId: { type: string, format: uuid }
+        providerId: { type: string }
+        externalTransactionId: { type: string }
+        status: { type: string, enum: [PENDING, PENDING_REFERENCE, PROCESSED, REJECTED, FAILED] }
+        kind: { type: string, enum: [OPENING, BET, WIN, LOSS, REFUND, ROLLBACK] }
+        walletId: { type: string, format: uuid }
+        playerId: { type: string, format: uuid }
+        roundId: { type: string }
+        gameId: { type: string }
+        money: { $ref: "#/components/schemas/Money" }
+        referenceExternalTransactionId: { type: string }
+        failureCode: { type: string }
+        balance:
+          $ref: "#/components/schemas/Money"
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          properties:
+            postgres: { type: string, enum: [ok, unavailable] }
+            sqs: { type: string, enum: [ok, unavailable] }
