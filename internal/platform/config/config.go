@@ -62,6 +62,7 @@ type SQS struct {
 	AccessKeyID               string
 	SecretAccessKey           string
 	WagerTransactionsQueueURL string
+	WagerTransactionsDLQURL   string
 	EventsQueueURL            string
 }
 
@@ -71,6 +72,7 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	LogLevel        string
 	HTTPAddr        string
+	MetricsAddr     string
 	Postgres        Postgres
 	OIDC            OIDC
 	SQS             SQS
@@ -86,9 +88,10 @@ type LookupFunc func(key string) (string, bool)
 // caller proceeds to build anything.
 func Load(lookup LookupFunc) (*Config, error) {
 	cfg := &Config{
-		AppEnv:   getOr(lookup, "APP_ENV", "local"),
-		LogLevel: getOr(lookup, "LOG_LEVEL", "info"),
-		HTTPAddr: getOr(lookup, "APP_HTTP_ADDR", ":8080"),
+		AppEnv:      getOr(lookup, "APP_ENV", "local"),
+		LogLevel:    getOr(lookup, "LOG_LEVEL", "info"),
+		HTTPAddr:    getOr(lookup, "APP_HTTP_ADDR", ":8080"),
+		MetricsAddr: getOr(lookup, "METRICS_ADDR", ":9090"),
 	}
 
 	shutdownTimeout, err := parseDuration(lookup, "APP_SHUTDOWN_TIMEOUT", 15*time.Second)
@@ -127,6 +130,10 @@ func loadSQS(lookup LookupFunc) (SQS, error) {
 	if err != nil {
 		return SQS{}, err
 	}
+	dlqURL, err := require(lookup, "SQS_WAGER_TRANSACTIONS_DLQ_URL")
+	if err != nil {
+		return SQS{}, err
+	}
 	eventsQueueURL, err := require(lookup, "SQS_EVENTS_QUEUE_URL")
 	if err != nil {
 		return SQS{}, err
@@ -137,6 +144,7 @@ func loadSQS(lookup LookupFunc) (SQS, error) {
 		AccessKeyID:               getOr(lookup, "AWS_ACCESS_KEY_ID", ""),
 		SecretAccessKey:           getOr(lookup, "AWS_SECRET_ACCESS_KEY", ""),
 		WagerTransactionsQueueURL: queueURL,
+		WagerTransactionsDLQURL:   dlqURL,
 		EventsQueueURL:            eventsQueueURL,
 	}, nil
 }

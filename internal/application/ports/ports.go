@@ -177,6 +177,12 @@ type OutboxRepository interface {
 	// republication after a crash between publish and this call must reuse
 	// the same eventId, never generate a new one.
 	MarkPublished(ctx context.Context, eventID uuid.UUID, publishedAt time.Time) error
+	// OldestUnpublishedOccurredAt returns the occurredAt of the oldest row
+	// with published_at still NULL, and whether one exists at all — used
+	// only for the "outbox lag" observability gauge (Fase 13); false with
+	// no error means the outbox is fully drained, a healthy state, not a
+	// missing one.
+	OldestUnpublishedOccurredAt(ctx context.Context) (occurredAt time.Time, exists bool, err error)
 }
 
 // EventPublisher is the port the outbox worker (Fase 11) depends on to

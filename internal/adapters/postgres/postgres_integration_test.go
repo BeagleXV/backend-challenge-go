@@ -353,6 +353,39 @@ func TestOutboxRepository_ClaimBatch_TwoPublishersDoNotDoubleClaim(t *testing.T)
 	}
 }
 
+func TestOutboxRepository_OldestUnpublishedOccurredAt(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	uow := postgres.NewUnitOfWork(pool)
+	outbox := postgres.NewOutboxRepository(pool)
+
+	_, exists, err := outbox.OldestUnpublishedOccurredAt(ctx)
+	require.NoError(t, err)
+	require.False(t, exists, "a fully drained outbox reports no oldest pending event")
+
+	older := time.Now().UTC().Add(-time.Hour)
+	newer := time.Now().UTC()
+	olderID := uuid.New()
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error {
+		return outbox.Enqueue(ctx, olderID, uuid.New(), "WagerTransactionProcessed", []byte(`{}`), older)
+	}))
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error {
+		return outbox.Enqueue(ctx, uuid.New(), uuid.New(), "WalletBalanceChanged", []byte(`{}`), newer)
+	}))
+
+	occurredAt, exists, err := outbox.OldestUnpublishedOccurredAt(ctx)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.WithinDuration(t, older, occurredAt, time.Millisecond, "must report the older of the two, regardless of insertion order")
+
+	// Publishing the older one leaves the newer as the new oldest pending.
+	require.NoError(t, outbox.MarkPublished(ctx, olderID, time.Now().UTC()))
+	occurredAt, exists, err = outbox.OldestUnpublishedOccurredAt(ctx)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.WithinDuration(t, newer, occurredAt, time.Millisecond)
+}
+
 func TestWagerTransactionRepository_HasSuccessfulReversal(t *testing.T) {
 	pool := testDB(t)
 	ctx := context.Background()

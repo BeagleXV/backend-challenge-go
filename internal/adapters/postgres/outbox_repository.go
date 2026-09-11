@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,4 +106,18 @@ func (r *OutboxRepository) MarkPublished(ctx context.Context, eventID uuid.UUID,
 		return mapErr(pgx.ErrNoRows, "outbox.MarkPublished")
 	}
 	return nil
+}
+
+func (r *OutboxRepository) OldestUnpublishedOccurredAt(ctx context.Context) (time.Time, bool, error) {
+	var occurredAt time.Time
+	err := q(ctx, r.pool).QueryRow(ctx,
+		`SELECT occurred_at FROM outbox_events WHERE published_at IS NULL ORDER BY occurred_at LIMIT 1`,
+	).Scan(&occurredAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, mapErr(err, "outbox.OldestUnpublishedOccurredAt")
+	}
+	return occurredAt, true, nil
 }

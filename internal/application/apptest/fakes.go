@@ -610,3 +610,20 @@ func (r *OutboxRepository) MarkPublished(ctx context.Context, eventID uuid.UUID,
 	}
 	return fmt.Errorf("outbox event %s: %w", eventID, ports.ErrNotFound)
 }
+
+func (r *OutboxRepository) OldestUnpublishedOccurredAt(ctx context.Context) (time.Time, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var oldest time.Time
+	found := false
+	for _, e := range r.Events {
+		if e.PublishedAt != nil {
+			continue
+		}
+		if !found || e.OccurredAt.Before(oldest) {
+			oldest = e.OccurredAt
+			found = true
+		}
+	}
+	return oldest, found, nil
+}
