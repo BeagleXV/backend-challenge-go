@@ -32,7 +32,24 @@ services:
       timeout: 5s
       retries: 20
 
-# LocalStack e o serviço da aplicação entram nas fases correspondentes (9, 17).
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - "127.0.0.1:4566:4566"
+    volumes:
+      - ./deploy/localstack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+# O serviço da aplicação entra na fase correspondente (17).
 
 volumes:
   postgres_data:
+  localstack_data:
