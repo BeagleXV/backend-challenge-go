@@ -626,3 +626,206 @@ func TestWagerTransactionRepository_PendingReferenceRetryLifecycle(t *testing.T)
 	require.NoError(t, err)
 	require.Empty(t, ready)
 }
+
+// TestReconciliation_RepeatableRead_ConsistentSnapshotDespiteConcurrentWrite
+// is the Fase 12 proof: reconciliation reads the wallet balance, then
+// (later, as a separate statement) the full ledger. Under the default READ
+// COMMITTED isolation, a BET committing in between those two reads would
+// make an entirely healthy wallet look divergent — the balance read
+// reflects the old state, the ledger read reflects the new one. This test
+// drives exactly that interleaving by hand, through
+// UnitOfWork.WithinRepeatableReadTx (what reconciliation.Service actually
+// uses), and asserts the snapshot it computes is entirely
+// pre-concurrent-write and self-consistent — never a spurious mismatch.
+func TestReconciliation_RepeatableRead_ConsistentSnapshotDespiteConcurrentWrite(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	uow := postgres.NewUnitOfWork(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	txs := postgres.NewWagerTransactionRepository(pool)
+	ledgers := postgres.NewLedgerRepository(pool)
+
+	walletID := insertWallet(t, ctx, uow, wallets, "1000.00")
+
+	opening, err := wagertransaction.NewInternalOpening(wagertransaction.NewInternalOpeningParams{
+		ID: uuid.New(), WalletID: walletID, PlayerID: uuid.New(), Amount: mustMoney(t, "1000.00"), Now: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Insert(ctx, opening) }))
+
+	openingEntry, err := ledger.New(ledger.NewParams{
+		ID: uuid.New(), WalletID: walletID, TransactionID: opening.ID(),
+		Direction: ledger.DirectionCredit, Amount: mustMoney(t, "1000.00"),
+		BalanceBefore: mustMoney(t, "0.00"), BalanceAfter: mustMoney(t, "1000.00"),
+		CreatedAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return ledgers.Append(ctx, openingEntry) }))
+
+	type snapshot struct {
+		balance    string
+		ledgerSum  string
+		entryCount int
+	}
+	readyForConcurrentWrite := make(chan struct{})
+	continueSecondRead := make(chan struct{})
+	resultCh := make(chan snapshot, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- uow.WithinRepeatableReadTx(ctx, func(ctx context.Context) error {
+			w, err := wallets.GetByID(ctx, walletID) // first statement: pins the snapshot
+			if err != nil {
+				return err
+			}
+			close(readyForConcurrentWrite)
+			<-continueSecondRead
+
+			entries, err := ledgers.ListByWallet(ctx, walletID)
+			if err != nil {
+				return err
+			}
+			sum, err := money.Zero(money.BRL)
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				switch e.Direction() {
+				case ledger.DirectionCredit:
+					sum, err = sum.Add(e.Amount())
+				case ledger.DirectionDebit:
+					sum, err = sum.Sub(e.Amount())
+				}
+				if err != nil {
+					return err
+				}
+			}
+			resultCh <- snapshot{balance: w.Balance().String(), ledgerSum: sum.String(), entryCount: len(entries)}
+			return nil
+		})
+	}()
+
+	<-readyForConcurrentWrite
+
+	// The concurrent write: a real BET, processed end to end on its own
+	// connection while the reconciliation transaction above sits between
+	// its two reads.
+	svc := processwagertransaction.New(
+		postgres.NewUnitOfWork(pool), wallets, txs, ledgers,
+		postgres.NewInboxRepository(pool), postgres.NewOutboxRepository(pool),
+		systemClock{}, uuidGenerator{},
+	)
+	betResult, err := svc.Handle(ctx, processwagertransaction.Request{
+		IdempotencyKey: "provider-a:bet-concurrent-1", ProviderID: "provider-a", ExternalTransactionID: "bet-concurrent-1",
+		WalletID: walletID, PlayerID: uuid.New(), RoundID: "round-1", GameID: "game-1",
+		Kind: wagertransaction.KindBet, Amount: mustMoney(t, "100.00"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusProcessed, betResult.Status)
+
+	close(continueSecondRead)
+	require.NoError(t, <-errCh)
+	snap := <-resultCh
+
+	// Both reads the reconciliation transaction made came from strictly
+	// before the concurrent BET — self-consistent, never a spurious
+	// mismatch caused purely by timing.
+	require.Equal(t, "1000.00", snap.balance)
+	require.Equal(t, "1000.00", snap.ledgerSum)
+	require.Equal(t, 1, snap.entryCount)
+
+	// The concurrent write really did happen — an ordinary read (no
+	// transaction, no snapshot) sees it.
+	w, err := wallets.GetByID(ctx, walletID)
+	require.NoError(t, err)
+	require.Equal(t, "900.00", w.Balance().String())
+}
+
+// TestReadCommitted_SameInterleaving_ProducesSpuriousDivergence is the
+// negative control for the test above: the exact same interleaving, but
+// through plain WithinTx (READ COMMITTED, what every other use case in
+// this codebase correctly uses) instead of WithinRepeatableReadTx. It
+// reproduces the bug reconciliation.Service would have if it used the
+// wrong isolation level — the balance read observes the old value, the
+// ledger read observes the new entry, and the two together look like a
+// 100.00 divergence in a wallet that was never actually wrong. This is
+// what justifies Reconcile's use of WithinRepeatableReadTx being load-
+// bearing rather than a defensive nicety.
+func TestReadCommitted_SameInterleaving_ProducesSpuriousDivergence(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	uow := postgres.NewUnitOfWork(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	txs := postgres.NewWagerTransactionRepository(pool)
+	ledgers := postgres.NewLedgerRepository(pool)
+
+	walletID := insertWallet(t, ctx, uow, wallets, "1000.00")
+
+	opening, err := wagertransaction.NewInternalOpening(wagertransaction.NewInternalOpeningParams{
+		ID: uuid.New(), WalletID: walletID, PlayerID: uuid.New(), Amount: mustMoney(t, "1000.00"), Now: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Insert(ctx, opening) }))
+
+	openingEntry, err := ledger.New(ledger.NewParams{
+		ID: uuid.New(), WalletID: walletID, TransactionID: opening.ID(),
+		Direction: ledger.DirectionCredit, Amount: mustMoney(t, "1000.00"),
+		BalanceBefore: mustMoney(t, "0.00"), BalanceAfter: mustMoney(t, "1000.00"),
+		CreatedAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return ledgers.Append(ctx, openingEntry) }))
+
+	readyForConcurrentWrite := make(chan struct{})
+	continueSecondRead := make(chan struct{})
+	balanceCh := make(chan string, 1)
+	entryCountCh := make(chan int, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- uow.WithinTx(ctx, func(ctx context.Context) error { // READ COMMITTED, on purpose
+			w, err := wallets.GetByID(ctx, walletID)
+			if err != nil {
+				return err
+			}
+			balanceCh <- w.Balance().String()
+			close(readyForConcurrentWrite)
+			<-continueSecondRead
+
+			entries, err := ledgers.ListByWallet(ctx, walletID)
+			if err != nil {
+				return err
+			}
+			entryCountCh <- len(entries)
+			return nil
+		})
+	}()
+
+	<-readyForConcurrentWrite
+
+	svc := processwagertransaction.New(
+		postgres.NewUnitOfWork(pool), wallets, txs, ledgers,
+		postgres.NewInboxRepository(pool), postgres.NewOutboxRepository(pool),
+		systemClock{}, uuidGenerator{},
+	)
+	betResult, err := svc.Handle(ctx, processwagertransaction.Request{
+		IdempotencyKey: "provider-a:bet-concurrent-2", ProviderID: "provider-a", ExternalTransactionID: "bet-concurrent-2",
+		WalletID: walletID, PlayerID: uuid.New(), RoundID: "round-1", GameID: "game-1",
+		Kind: wagertransaction.KindBet, Amount: mustMoney(t, "100.00"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusProcessed, betResult.Status)
+
+	close(continueSecondRead)
+	require.NoError(t, <-errCh)
+
+	balance := <-balanceCh
+	entryCount := <-entryCountCh
+
+	// The balance read is stale (pre-BET) but the ledger read is fresh
+	// (post-BET) — under READ COMMITTED, each statement gets its own
+	// snapshot. Comparing the two, as reconciliation does, would report a
+	// 100.00 difference for a wallet that is, and always was, correct.
+	require.Equal(t, "1000.00", balance, "read before the concurrent commit")
+	require.Equal(t, 2, entryCount, "read after the concurrent commit — sees the new BET's ledger entry the balance read above does not know about")
+}
