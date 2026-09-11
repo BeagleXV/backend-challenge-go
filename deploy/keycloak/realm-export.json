@@ -82,6 +82,35 @@
       ]
     },
     {
+      "clientId": "provider-a-shortlived",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "provider-a-shortlived-secret-local-only",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "attributes": {
+        "access.token.lifespan": "2"
+      },
+      "protocolMappers": [
+        {
+          "name": "providerId",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "providerId",
+            "claim.value": "provider-a",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
       "clientId": "internal-service",
       "enabled": true,
       "protocol": "openid-connect",
