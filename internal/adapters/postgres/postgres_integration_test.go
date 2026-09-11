@@ -139,6 +139,79 @@ func TestWalletRepository_GetForUpdate_SerializesAcrossRealConnections(t *testin
 	require.Equal(t, "20.00", final.Balance().String())
 }
 
+// TestWalletRepository_GetForUpdate_DistinctWallets_DoNotSerializeAgainstEachOther
+// is Fase 16's scenario 3, the counterpart to the test above: the
+// pessimistic lock must be scoped to each wallet's own row, never a
+// table-wide or otherwise shared lock. This is proven deterministically,
+// without any sleep or wall-clock comparison, via a rendezvous: every
+// goroutine locks its own distinct wallet, then blocks on a shared
+// "release" channel before committing. If GetForUpdate serialized across
+// wallets, only the first goroutine could ever reach the rendezvous — every
+// other would still be blocked inside GetForUpdate, waiting for a
+// transaction that itself cannot proceed without every goroutine having
+// already rendezvoused: a deadlock. Reaching the rendezvous for every
+// goroutine within a generous deadline (used here purely as deadlock
+// detection, not a performance measurement) is only possible if each
+// wallet's lock is independent.
+func TestWalletRepository_GetForUpdate_DistinctWallets_DoNotSerializeAgainstEachOther(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	uow := postgres.NewUnitOfWork(pool)
+	wallets := postgres.NewWalletRepository(pool)
+
+	const n = 5
+	walletIDs := make([]uuid.UUID, n)
+	for i := range walletIDs {
+		walletIDs[i] = insertWallet(t, ctx, uow, wallets, "100.00")
+	}
+
+	acquired := make(chan int, n)
+	release := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = uow.WithinTx(ctx, func(ctx context.Context) error {
+				w, err := wallets.GetForUpdate(ctx, walletIDs[i])
+				if err != nil {
+					return err
+				}
+				acquired <- i
+				<-release
+				_, _, err = w.Debit(mustMoney(t, "10.00"), time.Now().UTC())
+				if err != nil {
+					return err
+				}
+				return wallets.Update(ctx, w)
+			})
+		}(i)
+	}
+
+	deadline := time.After(5 * time.Second)
+	seen := 0
+	for seen < n {
+		select {
+		case <-acquired:
+			seen++
+		case <-deadline:
+			t.Fatalf("only %d/%d distinct-wallet locks acquired within the deadline — wallets appear to be serializing against a shared lock instead of their own row", seen, n)
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "wallet %d", i)
+	}
+	for i, walletID := range walletIDs {
+		final, err := wallets.GetByID(ctx, walletID)
+		require.NoError(t, err)
+		require.Equal(t, "90.00", final.Balance().String(), "wallet %d", i)
+	}
+}
+
 func TestWalletRepository_Insert_DuplicatePlayerCurrency_ReturnsAlreadyExists(t *testing.T) {
 	pool := testDB(t)
 	ctx := context.Background()
