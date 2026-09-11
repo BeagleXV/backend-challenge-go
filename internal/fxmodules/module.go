@@ -19,6 +19,8 @@ func All(cfg *config.Config) []fx.Option {
 		LoggingModule,
 		PostgresModule,
 		ApplicationModule,
+		IDPModule,
+		HTTPAPIModule,
 		BootstrapModule,
 		fx.StopTimeout(cfg.ShutdownTimeout),
 	}
