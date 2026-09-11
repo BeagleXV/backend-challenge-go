@@ -18,6 +18,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/money"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wallet"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 type wageringTestHarness struct {
@@ -38,7 +39,7 @@ func newWageringTestHarness() *wageringTestHarness {
 	processor := processwagertransaction.New(apptest.NoopUnitOfWork{}, wallets, txs, ledgers, inbox, outbox, clock, ids)
 
 	return &wageringTestHarness{
-		handlers: newWageringHandlers(processor, txs, zapNop()),
+		handlers: newWageringHandlers(processor, txs, metrics.NewNoop(), zapNop()),
 		wallets:  wallets,
 		txs:      txs,
 	}

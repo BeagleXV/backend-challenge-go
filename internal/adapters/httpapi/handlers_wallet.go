@@ -11,6 +11,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/openwallet"
 	"github.com/beaglexv/backend-challenge-go/internal/application/ports"
 	"github.com/beaglexv/backend-challenge-go/internal/application/reconciliation"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 const defaultLedgerPageLimit = 50
@@ -26,6 +27,7 @@ type walletHandlers struct {
 	wallets    ports.WalletRepository
 	ledgers    ports.LedgerRepository
 	idGen      ports.IDGenerator
+	metrics    *metrics.Metrics
 	logger     *zap.Logger
 }
 
@@ -35,6 +37,7 @@ func newWalletHandlers(
 	wallets ports.WalletRepository,
 	ledgers ports.LedgerRepository,
 	idGen ports.IDGenerator,
+	m *metrics.Metrics,
 	logger *zap.Logger,
 ) *walletHandlers {
 	return &walletHandlers{
@@ -43,6 +46,7 @@ func newWalletHandlers(
 		wallets:    wallets,
 		ledgers:    ledgers,
 		idGen:      idGen,
+		metrics:    m,
 		logger:     logger,
 	}
 }
@@ -169,6 +173,7 @@ func (h *walletHandlers) reconciliationHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	if !result.Consistent {
+		h.metrics.RecordReconciliationDivergence(r.Context())
 		h.logger.Warn("reconciliation_divergence",
 			zap.String("walletId", walletID.String()),
 			zap.String("storedBalance", result.StoredBalance.String()),

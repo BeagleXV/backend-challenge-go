@@ -21,6 +21,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/application/resolvependingreference"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wagertransaction"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // Config tunes the worker's polling and give-up policy. Zero values are
@@ -71,14 +72,15 @@ func (c Config) withDefaults() Config {
 type Worker struct {
 	resolver *resolvependingreference.Service
 	cfg      Config
+	metrics  *metrics.Metrics
 	logger   *zap.Logger
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-func New(resolver *resolvependingreference.Service, cfg Config, logger *zap.Logger) *Worker {
-	return &Worker{resolver: resolver, cfg: cfg.withDefaults(), logger: logger}
+func New(resolver *resolvependingreference.Service, cfg Config, m *metrics.Metrics, logger *zap.Logger) *Worker {
+	return &Worker{resolver: resolver, cfg: cfg.withDefaults(), metrics: m, logger: logger}
 }
 
 // Start launches the poll loop in the background and returns immediately.
@@ -143,39 +145,53 @@ func (w *Worker) handleCandidate(ctx context.Context, now time.Time, tx *wagertr
 	exhausted := tx.PendingReferenceAttempts() >= w.cfg.MaxAttempts || now.Sub(tx.CreatedAt()) >= w.cfg.TTL
 
 	if exhausted {
+		start := time.Now()
 		result, err := w.resolver.Expire(ctx, tx.ID(), "")
+		w.metrics.RecordProcessingDuration(ctx, metrics.TransportWorker, time.Since(start))
 		if err != nil {
-			w.logRaceOrError("expire", tx.ID(), err)
+			w.recordRaceOrError(ctx, "expire", tx.ID(), err)
 			return
 		}
+		w.metrics.RecordWagerTransaction(ctx, string(result.Status), metrics.TransportWorker, false)
 		w.logger.Info("referenceworker: expired pending reference",
 			zap.String("transactionId", result.TransactionID.String()),
+			zap.String("walletId", tx.WalletID().String()),
+			zap.String("providerId", tx.ProviderID()),
 			zap.Int("attempts", tx.PendingReferenceAttempts()),
 			zap.Duration("age", now.Sub(tx.CreatedAt())),
 		)
 		return
 	}
 
+	start := time.Now()
 	result, err := w.resolver.Resolve(ctx, tx.ID(), "")
+	w.metrics.RecordProcessingDuration(ctx, metrics.TransportWorker, time.Since(start))
 	if err != nil {
-		w.logRaceOrError("resolve", tx.ID(), err)
+		w.recordRaceOrError(ctx, "resolve", tx.ID(), err)
 		return
+	}
+	w.metrics.RecordWagerTransaction(ctx, string(result.Status), metrics.TransportWorker, false)
+	if result.Status == wagertransaction.StatusPendingReference {
+		w.metrics.RecordRetry(ctx, metrics.RetryKindPendingReference)
 	}
 	w.logger.Info("referenceworker: attempted pending reference resolution",
 		zap.String("transactionId", result.TransactionID.String()),
+		zap.String("walletId", tx.WalletID().String()),
+		zap.String("providerId", tx.ProviderID()),
 		zap.String("status", string(result.Status)),
 	)
 }
 
-// logRaceOrError distinguishes the benign race — another instance (or a
+// recordRaceOrError distinguishes the benign race — another instance (or a
 // direct HTTP/SQS resume) already resolved this transaction between this
 // poll listing it and this worker acting on it — from an actual failure.
 // Resume/ExpirePendingReference both return ErrNotPendingReference in
 // exactly that case, since GetForUpdate serializes against any concurrent
 // attempt on the same row and re-validates status after acquiring the
 // lock.
-func (w *Worker) logRaceOrError(op string, transactionID uuid.UUID, err error) {
+func (w *Worker) recordRaceOrError(ctx context.Context, op string, transactionID uuid.UUID, err error) {
 	if errors.Is(err, processwagertransaction.ErrNotPendingReference) {
+		w.metrics.RecordConcurrencyConflict(ctx, metrics.ConflictReasonPendingReferenceRace)
 		w.logger.Debug("referenceworker: candidate already resolved by another attempt", zap.String("op", op), zap.String("transactionId", transactionID.String()))
 		return
 	}

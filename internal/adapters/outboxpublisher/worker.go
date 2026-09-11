@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/beaglexv/backend-challenge-go/internal/application/ports"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // Config tunes the worker's polling, batching and lock-recovery behavior.
@@ -51,6 +52,7 @@ type Worker struct {
 	outbox     ports.OutboxRepository
 	publisher  ports.EventPublisher
 	cfg        Config
+	metrics    *metrics.Metrics
 	logger     *zap.Logger
 	instanceID string
 
@@ -58,12 +60,13 @@ type Worker struct {
 	done   chan struct{}
 }
 
-func New(uow ports.UnitOfWork, outbox ports.OutboxRepository, publisher ports.EventPublisher, cfg Config, logger *zap.Logger) *Worker {
+func New(uow ports.UnitOfWork, outbox ports.OutboxRepository, publisher ports.EventPublisher, cfg Config, m *metrics.Metrics, logger *zap.Logger) *Worker {
 	return &Worker{
 		uow:        uow,
 		outbox:     outbox,
 		publisher:  publisher,
 		cfg:        cfg.withDefaults(),
+		metrics:    m,
 		logger:     logger,
 		instanceID: instanceID(),
 	}
@@ -143,6 +146,12 @@ func (w *Worker) runOnce(ctx context.Context) {
 // instance's next poll or another's, per Config.LockDuration's doc
 // comment.
 func (w *Worker) publishOne(ctx context.Context, rec ports.OutboxRecord) {
+	if rec.Attempts > 1 {
+		// Attempts is incremented by ClaimBatch on every claim, including
+		// the first — >1 means this row was reclaimed after a previous
+		// attempt didn't finish (failed publish or a crashed instance).
+		w.metrics.RecordRetry(ctx, metrics.RetryKindOutboxPublish)
+	}
 	if err := w.publisher.Publish(ctx, rec.EventID, rec.AggregateID, rec.EventType, rec.Payload); err != nil {
 		w.logger.Error("outboxpublisher: publish failed, will retry after lock expires",
 			zap.String("eventId", rec.EventID.String()),

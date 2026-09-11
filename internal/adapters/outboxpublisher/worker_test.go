@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/beaglexv/backend-challenge-go/internal/application/apptest"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // fakePublisher is a controllable ports.EventPublisher: it records every
@@ -69,7 +70,7 @@ func TestRunOnce_PublishesAndMarksPublished(t *testing.T) {
 	require.NoError(t, outbox.Enqueue(context.Background(), eventID, uuid.New(), "WagerTransactionProcessed", []byte(`{}`), time.Now()))
 
 	pub := newFakePublisher()
-	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{}, zaptest.NewLogger(t))
+	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{}, metrics.NewNoop(), zaptest.NewLogger(t))
 
 	w.runOnce(context.Background())
 
@@ -85,7 +86,7 @@ func TestRunOnce_PublishFailure_LeavesEventClaimedNotPublished(t *testing.T) {
 
 	pub := newFakePublisher()
 	pub.setFail(eventID, true)
-	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{LockDuration: time.Hour}, zaptest.NewLogger(t))
+	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{LockDuration: time.Hour}, metrics.NewNoop(), zaptest.NewLogger(t))
 
 	w.runOnce(context.Background())
 
@@ -106,7 +107,7 @@ func TestRunOnce_AbandonedLock_ReclaimedAfterExpiry(t *testing.T) {
 
 	pub := newFakePublisher()
 	pub.setFail(eventID, true)
-	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{LockDuration: 20 * time.Millisecond}, zaptest.NewLogger(t))
+	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{LockDuration: 20 * time.Millisecond}, metrics.NewNoop(), zaptest.NewLogger(t))
 
 	w.runOnce(context.Background())
 	assert.Equal(t, 1, pub.callCount(eventID))
@@ -138,7 +139,7 @@ func TestRunOnce_MarkPublishedFailure_RemainsClaimedForRetry(t *testing.T) {
 	pub := newFakePublisher()
 	// Delete the row the instant Publish is called, before MarkPublished
 	// runs, forcing MarkPublished to fail with ErrNotFound.
-	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{}, zaptest.NewLogger(t))
+	w := New(apptest.NoopUnitOfWork{}, outbox, pub, Config{}, metrics.NewNoop(), zaptest.NewLogger(t))
 	pub.callHook = func(id uuid.UUID) {
 		outbox.Events = nil
 	}
@@ -156,8 +157,8 @@ func TestTwoWorkers_ConcurrentPoll_NeitherDoubleClaimsWhileLockIsFresh(t *testin
 
 	pubA := newFakePublisher()
 	pubB := newFakePublisher()
-	workerA := New(apptest.NoopUnitOfWork{}, outbox, pubA, Config{LockDuration: time.Hour}, zaptest.NewLogger(t))
-	workerB := New(apptest.NoopUnitOfWork{}, outbox, pubB, Config{LockDuration: time.Hour}, zaptest.NewLogger(t))
+	workerA := New(apptest.NoopUnitOfWork{}, outbox, pubA, Config{LockDuration: time.Hour}, metrics.NewNoop(), zaptest.NewLogger(t))
+	workerB := New(apptest.NoopUnitOfWork{}, outbox, pubB, Config{LockDuration: time.Hour}, metrics.NewNoop(), zaptest.NewLogger(t))
 
 	workerA.runOnce(context.Background())
 	workerB.runOnce(context.Background())
@@ -170,7 +171,7 @@ func TestStart_Stop_GracefulShutdown(t *testing.T) {
 	outbox := apptest.NewOutboxRepository()
 	require.NoError(t, outbox.Enqueue(context.Background(), uuid.New(), uuid.New(), "WagerTransactionProcessed", []byte(`{}`), time.Now()))
 
-	w := New(apptest.NoopUnitOfWork{}, outbox, newFakePublisher(), Config{PollInterval: 10 * time.Millisecond}, zaptest.NewLogger(t))
+	w := New(apptest.NoopUnitOfWork{}, outbox, newFakePublisher(), Config{PollInterval: 10 * time.Millisecond}, metrics.NewNoop(), zaptest.NewLogger(t))
 	w.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

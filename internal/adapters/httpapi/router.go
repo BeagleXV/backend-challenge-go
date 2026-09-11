@@ -21,6 +21,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/application/reconciliation"
 	"github.com/beaglexv/backend-challenge-go/internal/platform/config"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // NewRouter assembles every route in the contract. Health checks are
@@ -39,6 +40,7 @@ func NewRouter(
 	ledgers ports.LedgerRepository,
 	txs ports.WagerTransactionRepository,
 	idGen ports.IDGenerator,
+	m *metrics.Metrics,
 	logger *zap.Logger,
 ) http.Handler {
 	r := chi.NewRouter()
@@ -50,8 +52,8 @@ func NewRouter(
 	r.Get("/health/live", health.liveHandler)
 	r.Get("/health/ready", health.readyHandler)
 
-	walletH := newWalletHandlers(openWallet, reconcile, wallets, ledgers, idGen, logger)
-	wageringH := newWageringHandlers(processor, txs, logger)
+	walletH := newWalletHandlers(openWallet, reconcile, wallets, ledgers, idGen, m, logger)
+	wageringH := newWageringHandlers(processor, txs, m, logger)
 
 	auth := authMiddleware(verifier)
 

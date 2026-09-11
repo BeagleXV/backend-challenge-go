@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -12,16 +14,18 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/ports"
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wagertransaction"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 type wageringHandlers struct {
 	processor *processwagertransaction.Service
 	txs       ports.WagerTransactionRepository
+	metrics   *metrics.Metrics
 	logger    *zap.Logger
 }
 
-func newWageringHandlers(processor *processwagertransaction.Service, txs ports.WagerTransactionRepository, logger *zap.Logger) *wageringHandlers {
-	return &wageringHandlers{processor: processor, txs: txs, logger: logger}
+func newWageringHandlers(processor *processwagertransaction.Service, txs ports.WagerTransactionRepository, m *metrics.Metrics, logger *zap.Logger) *wageringHandlers {
+	return &wageringHandlers{processor: processor, txs: txs, metrics: m, logger: logger}
 }
 
 // statusHTTPCode maps a successfully-returned (err == nil) processing
@@ -65,6 +69,7 @@ func (h *wageringHandlers) submitHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	start := time.Now()
 	result, err := h.processor.Handle(r.Context(), processwagertransaction.Request{
 		IdempotencyKey:                 idempotencyKey,
 		ProviderID:                     req.ProviderID,
@@ -78,13 +83,24 @@ func (h *wageringHandlers) submitHandler(w http.ResponseWriter, r *http.Request)
 		ReferenceExternalTransactionID: req.ReferenceExternalTransactionID,
 		CorrelationID:                  correlationIDFromContext(r.Context()),
 	})
+	h.metrics.RecordProcessingDuration(r.Context(), metrics.TransportHTTP, time.Since(start))
 	if err != nil {
+		recordConflictMetric(r.Context(), h.metrics, err)
 		if writeApplicationError(w, err) {
 			return
 		}
 		writeUnexpectedError(w, r, h.logger, "wagering_submit", err)
 		return
 	}
+	h.metrics.RecordWagerTransaction(r.Context(), string(result.Status), metrics.TransportHTTP, result.IdempotentReplay)
+	h.logger.Info("wagering_submit_processed",
+		zap.String("correlationId", correlationIDFromContext(r.Context())),
+		zap.String("transactionId", result.TransactionID.String()),
+		zap.String("walletId", req.WalletID.String()),
+		zap.String("providerId", req.ProviderID),
+		zap.String("status", string(result.Status)),
+		zap.Bool("idempotentReplay", result.IdempotentReplay),
+	)
 
 	resp := wagerTransactionResultResponse{
 		TransactionID:    result.TransactionID,
@@ -96,6 +112,21 @@ func (h *wageringHandlers) submitHandler(w http.ResponseWriter, r *http.Request)
 		resp.Balance = &result.Balance
 	}
 	writeJSON(w, statusHTTPCode(result.Status), resp)
+}
+
+// recordConflictMetric records concurrency_conflicts_total for the two
+// conflict errors Handle can return — both are exactly the "two callers
+// raced" case the metric exists for; every other error either isn't a
+// conflict (validation, not-found) or, in the case of the transient
+// insert-race Handle already retries internally, never escapes to a
+// caller to be recorded here at all.
+func recordConflictMetric(ctx context.Context, m *metrics.Metrics, err error) {
+	switch {
+	case errors.Is(err, processwagertransaction.ErrIdempotencyConflict):
+		m.RecordConcurrencyConflict(ctx, metrics.ConflictReasonIdempotencyConflict)
+	case errors.Is(err, processwagertransaction.ErrExternalIDReused):
+		m.RecordConcurrencyConflict(ctx, metrics.ConflictReasonExternalIDReused)
+	}
 }
 
 func (h *wageringHandlers) getByIDHandler(w http.ResponseWriter, r *http.Request) {

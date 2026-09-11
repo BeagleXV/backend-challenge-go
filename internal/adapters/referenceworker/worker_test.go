@@ -16,6 +16,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/domain/money"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wallet"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 func mustMoney(t *testing.T, amount string) money.Money {
@@ -49,7 +50,7 @@ func newTestHarness(t *testing.T, cfg Config) *testHarness {
 	if cfg.Now == nil {
 		cfg.Now = func() time.Time { return clock.T }
 	}
-	worker := New(resolver, cfg, zaptest.NewLogger(t))
+	worker := New(resolver, cfg, metrics.NewNoop(), zaptest.NewLogger(t))
 
 	return &testHarness{worker: worker, wallets: wallets, txs: txs, processor: processor, nowFn: cfg.Now}
 }

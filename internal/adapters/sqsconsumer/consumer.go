@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // Config tunes the consumer's polling and concurrency behavior. Zero
@@ -85,14 +86,15 @@ type Consumer struct {
 	client    sqsAPI
 	cfg       Config
 	processor *processwagertransaction.Service
+	metrics   *metrics.Metrics
 	logger    *zap.Logger
 
 	cancelPoll context.CancelFunc
 	wg         sync.WaitGroup
 }
 
-func New(client *sqs.Client, cfg Config, processor *processwagertransaction.Service, logger *zap.Logger) *Consumer {
-	return &Consumer{client: client, cfg: cfg.withDefaults(), processor: processor, logger: logger}
+func New(client *sqs.Client, cfg Config, processor *processwagertransaction.Service, m *metrics.Metrics, logger *zap.Logger) *Consumer {
+	return &Consumer{client: client, cfg: cfg.withDefaults(), processor: processor, metrics: m, logger: logger}
 }
 
 // Start launches the poll loop in the background and returns immediately.
@@ -176,6 +178,7 @@ func (c *Consumer) handleMessage(ctx context.Context, msg types.Message) {
 
 	var env envelope
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		c.metrics.RecordRetry(ctx, metrics.RetryKindSQSMessage)
 		c.logger.Error("sqsconsumer: malformed message body, leaving for redrive",
 			zap.Error(err), zap.String("sqsMessageId", aws.ToString(msg.MessageId)))
 		return
@@ -183,13 +186,23 @@ func (c *Consumer) handleMessage(ctx context.Context, msg types.Message) {
 
 	req, err := env.toRequest(hash)
 	if err != nil {
+		c.metrics.RecordRetry(ctx, metrics.RetryKindSQSMessage)
 		c.logger.Error("sqsconsumer: invalid envelope, leaving for redrive",
 			zap.Error(err), zap.String("sqsMessageId", aws.ToString(msg.MessageId)))
 		return
 	}
 
+	start := time.Now()
 	result, err := c.processor.Handle(ctx, req)
+	c.metrics.RecordProcessingDuration(ctx, metrics.TransportSQS, time.Since(start))
 	if err != nil {
+		c.metrics.RecordRetry(ctx, metrics.RetryKindSQSMessage)
+		switch {
+		case errors.Is(err, processwagertransaction.ErrIdempotencyConflict):
+			c.metrics.RecordConcurrencyConflict(ctx, metrics.ConflictReasonIdempotencyConflict)
+		case errors.Is(err, processwagertransaction.ErrExternalIDReused):
+			c.metrics.RecordConcurrencyConflict(ctx, metrics.ConflictReasonExternalIDReused)
+		}
 		if errors.Is(err, processwagertransaction.ErrInboxHashMismatch) {
 			c.logger.Error("sqsconsumer: redelivered message content changed under the same messageId, leaving for redrive",
 				zap.String("messageId", env.MessageID))
@@ -199,10 +212,14 @@ func (c *Consumer) handleMessage(ctx context.Context, msg types.Message) {
 			zap.Error(err), zap.String("messageId", env.MessageID))
 		return
 	}
+	c.metrics.RecordWagerTransaction(ctx, string(result.Status), metrics.TransportSQS, result.IdempotentReplay)
 
 	c.logger.Info("sqsconsumer: processed wager transaction",
+		zap.String("correlationId", req.CorrelationID),
 		zap.String("messageId", env.MessageID),
 		zap.String("transactionId", result.TransactionID.String()),
+		zap.String("walletId", req.WalletID.String()),
+		zap.String("providerId", req.ProviderID),
 		zap.String("status", string(result.Status)),
 		zap.Bool("idempotentReplay", result.IdempotentReplay),
 	)

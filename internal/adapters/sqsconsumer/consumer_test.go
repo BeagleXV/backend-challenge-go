@@ -19,6 +19,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/money"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wallet"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // fakeSQS is a minimal, deterministic stand-in for *sqs.Client: one batch
@@ -88,6 +89,7 @@ func newTestConsumer(t *testing.T, sqsClient sqsAPI) (*Consumer, *apptest.Wallet
 		client:    sqsClient,
 		cfg:       Config{QueueURL: "http://localhost:4566/000000000000/wager-transactions.fifo"}.withDefaults(),
 		processor: processor,
+		metrics:   metrics.NewNoop(),
 		logger:    zaptest.NewLogger(t),
 	}
 	return c, wallets, w.ID()

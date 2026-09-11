@@ -17,6 +17,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/application/openwallet"
 	"github.com/beaglexv/backend-challenge-go/internal/application/reconciliation"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/money"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 type walletTestHarness struct {
@@ -37,7 +38,7 @@ func newWalletTestHarness() *walletTestHarness {
 	reconcile := reconciliation.New(apptest.NoopUnitOfWork{}, wallets, ledgers)
 
 	return &walletTestHarness{
-		handlers: newWalletHandlers(openWallet, reconcile, wallets, ledgers, ids, zapNop()),
+		handlers: newWalletHandlers(openWallet, reconcile, wallets, ledgers, ids, metrics.NewNoop(), zapNop()),
 		wallets:  wallets,
 		ledgers:  ledgers,
 	}
