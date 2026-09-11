@@ -83,9 +83,17 @@ type WagerTransactionRepository interface {
 	// instead of a raw constraint-violation error.
 	HasSuccessfulReversal(ctx context.Context, providerID, referenceExternalID string, kind wagertransaction.Kind) (bool, error)
 	// ListPendingReferenceForUpdate returns up to limit transactions in
-	// PENDING_REFERENCE, locked for update, for the pending-reference
-	// worker (Fase 10) to attempt resolution on.
-	ListPendingReferenceForUpdate(ctx context.Context, limit int) ([]*wagertransaction.WagerTransaction, error)
+	// PENDING_REFERENCE whose PendingReferenceNextAttemptAt is due
+	// (<= now), ordered by that same column, best-effort locked with
+	// SKIP LOCKED so concurrently-polling instances don't collide on the
+	// same candidates. This lock is released as soon as the query
+	// completes (there is no surrounding transaction held open across the
+	// caller's processing of the results) — it only reduces contention
+	// between simultaneous polls; the real mutual exclusion for actually
+	// resolving one of these transactions comes from
+	// WagerTransactionRepository.GetForUpdate inside
+	// processwagertransaction.Service.Resume's own transaction.
+	ListPendingReferenceForUpdate(ctx context.Context, now time.Time, limit int) ([]*wagertransaction.WagerTransaction, error)
 }
 
 // LedgerRepository appends and reads ledger entries.

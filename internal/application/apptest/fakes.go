@@ -257,6 +257,8 @@ func cloneWagerTransaction(tx *wagertransaction.WagerTransaction) *wagertransact
 		PlayerID:                       tx.PlayerID(),
 		Amount:                         tx.Amount(),
 		ResultBalance:                  resultBalance,
+		PendingReferenceAttempts:       tx.PendingReferenceAttempts(),
+		PendingReferenceNextAttemptAt:  pendingReferenceNextAttemptAtPtr(tx),
 		CreatedAt:                      tx.CreatedAt(),
 		UpdatedAt:                      tx.UpdatedAt(),
 	})
@@ -264,6 +266,13 @@ func cloneWagerTransaction(tx *wagertransaction.WagerTransaction) *wagertransact
 		panic(fmt.Sprintf("apptest: cloning a wager transaction that was already valid should never fail: %v", err))
 	}
 	return clone
+}
+
+func pendingReferenceNextAttemptAtPtr(tx *wagertransaction.WagerTransaction) *time.Time {
+	if next, ok := tx.PendingReferenceNextAttemptAt(); ok {
+		return &next
+	}
+	return nil
 }
 
 // Insert mirrors the real schema's unique indexes: a colliding
@@ -350,19 +359,29 @@ func (r *WagerTransactionRepository) HasSuccessfulReversal(ctx context.Context, 
 	return false, nil
 }
 
-func (r *WagerTransactionRepository) ListPendingReferenceForUpdate(ctx context.Context, limit int) ([]*wagertransaction.WagerTransaction, error) {
+func (r *WagerTransactionRepository) ListPendingReferenceForUpdate(ctx context.Context, now time.Time, limit int) ([]*wagertransaction.WagerTransaction, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var out []*wagertransaction.WagerTransaction
+	var ready []*wagertransaction.WagerTransaction
 	for _, tx := range r.byID {
-		if tx.Status() == wagertransaction.StatusPendingReference {
-			out = append(out, cloneWagerTransaction(tx))
-			if len(out) == limit {
-				break
-			}
+		if tx.Status() != wagertransaction.StatusPendingReference {
+			continue
 		}
+		next, ok := tx.PendingReferenceNextAttemptAt()
+		if !ok || next.After(now) {
+			continue
+		}
+		ready = append(ready, cloneWagerTransaction(tx))
 	}
-	return out, nil
+	sort.Slice(ready, func(i, j int) bool {
+		iNext, _ := ready[i].PendingReferenceNextAttemptAt()
+		jNext, _ := ready[j].PendingReferenceNextAttemptAt()
+		return iNext.Before(jNext)
+	})
+	if len(ready) > limit {
+		ready = ready[:limit]
+	}
+	return ready, nil
 }
 
 // LedgerRepository is an in-memory ports.LedgerRepository.

@@ -547,3 +547,82 @@ func TestProcessWagerTransaction_InboxAndOutboxCommitAtomicallyWithDomainChange(
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE published_at IS NOT NULL`).Scan(&publishedCount))
 	require.Zero(t, publishedCount, "nothing publishes an outbox row inline — that's the Fase 11 worker's job")
 }
+
+// TestWagerTransactionRepository_PendingReferenceRetryLifecycle proves,
+// against real Postgres, the parts of the Fase 10 retry/expiry bookkeeping
+// that only a real database can: the schema's own CHECK constraint
+// (status = 'PENDING_REFERENCE') = (pending_reference_next_attempt_at IS
+// NOT NULL) actually holds — in particular that transitioning a pending
+// transaction to REJECTED without clearing next_attempt_at would be
+// rejected by Postgres itself, not just assumed correct because the
+// domain layer's own transitionTo happens to clear it — and that
+// ListPendingReferenceForUpdate's real query filters by the due time
+// exactly as intended.
+func TestWagerTransactionRepository_PendingReferenceRetryLifecycle(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	uow := postgres.NewUnitOfWork(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	txs := postgres.NewWagerTransactionRepository(pool)
+
+	walletID := insertWallet(t, ctx, uow, wallets, "100.00")
+	now := time.Now().UTC()
+
+	refund, err := wagertransaction.NewExternal(wagertransaction.NewExternalParams{
+		ID: uuid.New(), ProviderID: "provider-a", ExternalTransactionID: "refund-1",
+		IdempotencyKey: "provider-a:refund-1", PayloadHash: "hash-1",
+		WalletID: walletID, PlayerID: uuid.New(), RoundID: "round-1", GameID: "game-1",
+		Kind: wagertransaction.KindRefund, Amount: mustMoney(t, "25.00"),
+		ReferenceExternalTransactionID: "bet-does-not-exist", Now: now,
+	})
+	require.NoError(t, err)
+	require.NoError(t, refund.MarkPendingReference(now, now.Add(30*time.Second)))
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Insert(ctx, refund) }))
+
+	// Not due yet.
+	ready, err := txs.ListPendingReferenceForUpdate(ctx, now.Add(10*time.Second), 10)
+	require.NoError(t, err)
+	require.Empty(t, ready)
+
+	// Due: the real query returns it, and the round trip preserved
+	// attempts/next_attempt_at exactly.
+	ready, err = txs.ListPendingReferenceForUpdate(ctx, now.Add(31*time.Second), 10)
+	require.NoError(t, err)
+	require.Len(t, ready, 1)
+	require.Equal(t, refund.ID(), ready[0].ID())
+	require.Equal(t, 1, ready[0].PendingReferenceAttempts())
+	gotNext, ok := ready[0].PendingReferenceNextAttemptAt()
+	require.True(t, ok)
+	require.WithinDuration(t, now.Add(30*time.Second), gotNext, time.Millisecond)
+
+	// A retry persists correctly too.
+	retryNow := now.Add(31 * time.Second)
+	require.NoError(t, refund.RecordPendingReferenceRetry(retryNow, retryNow.Add(60*time.Second)))
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Update(ctx, refund) }))
+
+	reloaded, err := txs.GetByID(ctx, refund.ID())
+	require.NoError(t, err)
+	require.Equal(t, 2, reloaded.PendingReferenceAttempts())
+
+	// Expiring it (REJECTED) must clear next_attempt_at — if the domain
+	// layer failed to do that, this UPDATE would violate the CHECK
+	// constraint and fail here, against real Postgres, regardless of what
+	// the in-memory fake would have allowed.
+	expireNow := retryNow.Add(90 * time.Second)
+	w, err := wallets.GetByID(ctx, walletID)
+	require.NoError(t, err)
+	reloaded.SetResultBalance(w.Balance())
+	require.NoError(t, reloaded.MarkRejected("REFERENCE_NOT_FOUND", expireNow))
+	require.NoError(t, uow.WithinTx(ctx, func(ctx context.Context) error { return txs.Update(ctx, reloaded) }))
+
+	final, err := txs.GetByID(ctx, refund.ID())
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusRejected, final.Status())
+	_, ok = final.PendingReferenceNextAttemptAt()
+	require.False(t, ok)
+
+	// Now terminal: no longer a candidate for the worker to pick up.
+	ready, err = txs.ListPendingReferenceForUpdate(ctx, expireNow.Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, ready)
+}

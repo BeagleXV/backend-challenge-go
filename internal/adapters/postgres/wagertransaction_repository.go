@@ -28,6 +28,7 @@ const wagerTransactionColumns = `
 	round_id, game_id, reference_external_transaction_id, resolved_reference_id,
 	wallet_id, player_id, money_amount, money_currency,
 	failure_code, result_balance_amount, result_balance_currency,
+	pending_reference_attempts, pending_reference_next_attempt_at,
 	created_at, updated_at`
 
 func scanWagerTransaction(row rowScanner) (*wagertransaction.WagerTransaction, error) {
@@ -43,6 +44,8 @@ func scanWagerTransaction(row rowScanner) (*wagertransaction.WagerTransaction, e
 		failureCode                                         *string
 		resultBalanceAmount                                 *int64
 		resultBalanceCurrency                               *string
+		pendingReferenceAttempts                            int
+		pendingReferenceNextAttemptAt                       *time.Time
 		createdAt, updatedAt                                time.Time
 	)
 
@@ -52,6 +55,7 @@ func scanWagerTransaction(row rowScanner) (*wagertransaction.WagerTransaction, e
 		&payloadHash, &roundID, &gameID, &referenceExternalTxID, &resolvedReferenceID,
 		&walletID, &playerID, &moneyAmount, &moneyCurrency,
 		&failureCode, &resultBalanceAmount, &resultBalanceCurrency,
+		&pendingReferenceAttempts, &pendingReferenceNextAttemptAt,
 		&createdAt, &updatedAt,
 	); err != nil {
 		return nil, err
@@ -94,6 +98,8 @@ func scanWagerTransaction(row rowScanner) (*wagertransaction.WagerTransaction, e
 		PlayerID:                       playerID,
 		Amount:                         amount,
 		ResultBalance:                  resultBalance,
+		PendingReferenceAttempts:       pendingReferenceAttempts,
+		PendingReferenceNextAttemptAt:  pendingReferenceNextAttemptAt,
 		CreatedAt:                      createdAt,
 		UpdatedAt:                      updatedAt,
 	})
@@ -139,6 +145,7 @@ func (r *WagerTransactionRepository) Insert(ctx context.Context, tx *wagertransa
 			round_id, game_id, reference_external_transaction_id, resolved_reference_id,
 			wallet_id, player_id, money_amount, money_currency,
 			failure_code, result_balance_amount, result_balance_currency,
+			pending_reference_attempts, pending_reference_next_attempt_at,
 			created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4,
@@ -146,17 +153,26 @@ func (r *WagerTransactionRepository) Insert(ctx context.Context, tx *wagertransa
 			$9, $10, $11, $12,
 			$13, $14, $15, $16,
 			$17, $18, $19,
-			$20, $21
+			$20, $21,
+			$22, $23
 		)`,
 		tx.ID(), string(tx.Origin()), string(tx.Kind()), string(tx.Status()),
 		nullable(tx.ProviderID()), nullable(tx.ExternalTransactionID()), nullable(tx.IdempotencyKey()), nullable(tx.PayloadHash()),
 		nullable(tx.RoundID()), nullable(tx.GameID()), nullable(tx.ReferenceExternalTransactionID()), nullableUUID(tx.ResolvedReferenceID()),
 		tx.WalletID(), tx.PlayerID(), tx.Amount().MinorUnits(), string(tx.Amount().Currency()),
 		nullable(tx.FailureCode()), resultAmount, resultCurrency,
+		tx.PendingReferenceAttempts(), pendingReferenceNextAttemptAtColumn(tx),
 		tx.CreatedAt(), tx.UpdatedAt(),
 	)
 	if err != nil {
 		return mapErr(err, "wagertransaction.Insert")
+	}
+	return nil
+}
+
+func pendingReferenceNextAttemptAtColumn(tx *wagertransaction.WagerTransaction) *time.Time {
+	if next, ok := tx.PendingReferenceNextAttemptAt(); ok {
+		return &next
 	}
 	return nil
 }
@@ -171,10 +187,12 @@ func (r *WagerTransactionRepository) Update(ctx context.Context, tx *wagertransa
 	tag, err := q(ctx, r.pool).Exec(ctx,
 		`UPDATE wager_transactions
 		 SET status = $2, failure_code = $3, resolved_reference_id = $4,
-		     result_balance_amount = $5, result_balance_currency = $6, updated_at = $7
+		     result_balance_amount = $5, result_balance_currency = $6, updated_at = $7,
+		     pending_reference_attempts = $8, pending_reference_next_attempt_at = $9
 		 WHERE id = $1`,
 		tx.ID(), string(tx.Status()), nullable(tx.FailureCode()), nullableUUID(tx.ResolvedReferenceID()),
 		resultAmount, resultCurrency, tx.UpdatedAt(),
+		tx.PendingReferenceAttempts(), pendingReferenceNextAttemptAtColumn(tx),
 	)
 	if err != nil {
 		return mapErr(err, "wagertransaction.Update")
@@ -249,14 +267,14 @@ func (r *WagerTransactionRepository) HasSuccessfulReversal(ctx context.Context, 
 	return exists, nil
 }
 
-func (r *WagerTransactionRepository) ListPendingReferenceForUpdate(ctx context.Context, limit int) ([]*wagertransaction.WagerTransaction, error) {
+func (r *WagerTransactionRepository) ListPendingReferenceForUpdate(ctx context.Context, now time.Time, limit int) ([]*wagertransaction.WagerTransaction, error) {
 	rows, err := q(ctx, r.pool).Query(ctx,
 		"SELECT "+wagerTransactionColumns+` FROM wager_transactions
-		 WHERE status = 'PENDING_REFERENCE'
-		 ORDER BY created_at
-		 LIMIT $1
+		 WHERE status = 'PENDING_REFERENCE' AND pending_reference_next_attempt_at <= $1
+		 ORDER BY pending_reference_next_attempt_at
+		 LIMIT $2
 		 FOR UPDATE SKIP LOCKED`,
-		limit,
+		now, limit,
 	)
 	if err != nil {
 		return nil, mapErr(err, "wagertransaction.ListPendingReferenceForUpdate")
