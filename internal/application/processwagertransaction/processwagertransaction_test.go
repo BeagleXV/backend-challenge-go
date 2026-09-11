@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/beaglexv/backend-challenge-go/internal/application/apptest"
+	"github.com/beaglexv/backend-challenge-go/internal/application/ports"
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/money"
 	"github.com/beaglexv/backend-challenge-go/internal/domain/wagertransaction"
@@ -29,6 +30,7 @@ type harness struct {
 	wallets *apptest.WalletRepository
 	txs     *apptest.WagerTransactionRepository
 	ledgers *apptest.LedgerRepository
+	inbox   *apptest.InboxRepository
 	outbox  *apptest.OutboxRepository
 }
 
@@ -42,7 +44,7 @@ func newHarness() *harness {
 	ids := &apptest.SequentialIDs{}
 
 	svc := processwagertransaction.New(apptest.NoopUnitOfWork{}, wallets, txs, ledgers, inbox, outbox, clock, ids)
-	return &harness{svc: svc, wallets: wallets, txs: txs, ledgers: ledgers, outbox: outbox}
+	return &harness{svc: svc, wallets: wallets, txs: txs, ledgers: ledgers, inbox: inbox, outbox: outbox}
 }
 
 func (h *harness) seedWallet(t *testing.T, balance string) uuid.UUID {
@@ -271,6 +273,58 @@ func TestHandle_Refund_ReferenceNotFound_MarksPendingReference(t *testing.T) {
 	w, err := h.wallets.GetByID(context.Background(), walletID)
 	require.NoError(t, err)
 	require.Equal(t, "100.00", w.Balance().String(), "wallet must not move while reference is pending")
+}
+
+// TestHandle_PendingReference_CompletesInboxMessageButStaysPending covers
+// the Fase 8 special case: an SQS-originated operation that lands in
+// PENDING_REFERENCE still completes its inbox message in the very same
+// commit that persists the pending transaction — safe precisely because
+// the pending state is itself durable, so a redelivery of that exact
+// message must never re-run resolution logic (it replays the persisted
+// PENDING_REFERENCE result instead), while the transaction itself remains
+// untouched and available for the pending-reference worker (Fase 10) to
+// resolve independently, on its own schedule.
+func TestHandle_PendingReference_CompletesInboxMessageButStaysPending(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	refund := baseRequest(walletID, wagertransaction.KindRefund, "25.00")
+	refund.Amount = mustMoney(t, "25.00")
+	refund.ReferenceExternalTransactionID = "does-not-exist"
+	refund.Inbox = &processwagertransaction.InboxInfo{
+		ConsumerName: "wager-consumer",
+		MessageID:    "msg-pending-1",
+		Hash:         "hash-pending-1",
+	}
+
+	first, err := h.svc.Handle(context.Background(), refund)
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusPendingReference, first.Status)
+	require.False(t, first.IdempotentReplay)
+
+	// The inbox record for this message must already exist — proving it
+	// was inserted (and, since MarkCompleted ran in the very same
+	// transaction, marked completed) despite the transaction itself
+	// never reaching a terminal state.
+	alreadyExists, err := h.inbox.TryInsert(context.Background(), ports.InboxMessage{
+		ConsumerName: "wager-consumer", MessageID: "msg-pending-1", Hash: "hash-pending-1",
+	})
+	require.NoError(t, err)
+	require.True(t, alreadyExists, "the inbox message must be durably recorded even though the transaction stayed PENDING_REFERENCE")
+
+	// Redelivery of the exact same SQS message must not re-attempt
+	// reference resolution — it replays the persisted pending result.
+	redelivered, err := h.svc.Handle(context.Background(), refund)
+	require.NoError(t, err)
+	require.True(t, redelivered.IdempotentReplay)
+	require.Equal(t, first.TransactionID, redelivered.TransactionID)
+	require.Equal(t, wagertransaction.StatusPendingReference, redelivered.Status)
+
+	// The transaction itself is untouched and still available for the
+	// pending-reference worker to pick up independently of inbox state.
+	tx, err := h.txs.GetByID(context.Background(), first.TransactionID)
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusPendingReference, tx.Status())
 }
 
 func TestHandle_Refund_AmountMustMatchReference(t *testing.T) {

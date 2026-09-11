@@ -466,3 +466,84 @@ func TestProcessWagerTransaction_SameBetSentFiftyTimesInParallel_SingleDebit(t *
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "exactly one debit for 50 identical concurrent submissions")
 }
+
+// TestProcessWagerTransaction_InboxAndOutboxCommitAtomicallyWithDomainChange
+// is the Fase 8 proof, against a real Postgres transaction rather than the
+// in-memory fakes: an SQS-originated BET's inbox record, wallet debit,
+// ledger entry and outbox events all land in the database as one commit.
+// Querying the pool directly afterwards (not through the application's own
+// UnitOfWork) confirms every one of them was actually durably committed,
+// not merely visible to the same in-flight transaction.
+func TestProcessWagerTransaction_InboxAndOutboxCommitAtomicallyWithDomainChange(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+
+	uow := postgres.NewUnitOfWork(pool)
+	wallets := postgres.NewWalletRepository(pool)
+	txs := postgres.NewWagerTransactionRepository(pool)
+	ledgers := postgres.NewLedgerRepository(pool)
+	inbox := postgres.NewInboxRepository(pool)
+	outbox := postgres.NewOutboxRepository(pool)
+
+	svc := processwagertransaction.New(uow, wallets, txs, ledgers, inbox, outbox, systemClock{}, uuidGenerator{})
+
+	walletID := insertWallet(t, ctx, uow, wallets, "100.00")
+
+	req := processwagertransaction.Request{
+		IdempotencyKey:        "provider-a:bet-atomic-1",
+		ProviderID:            "provider-a",
+		ExternalTransactionID: "bet-atomic-1",
+		WalletID:              walletID,
+		PlayerID:              uuid.New(),
+		RoundID:               "round-1",
+		GameID:                "game-1",
+		Kind:                  wagertransaction.KindBet,
+		Amount:                mustMoney(t, "25.00"),
+		CorrelationID:         "corr-1",
+		Inbox: &processwagertransaction.InboxInfo{
+			ConsumerName: "wager-consumer",
+			MessageID:    "sqs-msg-atomic-1",
+			Hash:         "hash-atomic-1",
+		},
+	}
+
+	result, err := svc.Handle(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusProcessed, result.Status)
+
+	// Domain change: wallet debited, exactly one ledger entry.
+	w, err := wallets.GetByID(ctx, walletID)
+	require.NoError(t, err)
+	require.Equal(t, "75.00", w.Balance().String())
+	entries, err := ledgers.ListByWallet(ctx, walletID)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	// Inbox: the exact same message, redelivered, is recognized as already
+	// handled — proving the row was committed, not rolled back with
+	// everything else it shares a transaction with.
+	alreadyExists, err := inbox.TryInsert(ctx, ports.InboxMessage{
+		ConsumerName: "wager-consumer", MessageID: "sqs-msg-atomic-1", Hash: "hash-atomic-1",
+	})
+	require.NoError(t, err)
+	require.True(t, alreadyExists)
+
+	// Outbox: both events this operation must produce (README section 11)
+	// are present, queued for the Fase 11 publisher — never published
+	// inline by this call, only ever written to this table.
+	var eventTypes []string
+	rows, err := pool.Query(ctx, `SELECT event_type FROM outbox_events WHERE aggregate_id = $1 OR aggregate_id = $2 ORDER BY event_type`, result.TransactionID, walletID)
+	require.NoError(t, err)
+	for rows.Next() {
+		var eventType string
+		require.NoError(t, rows.Scan(&eventType))
+		eventTypes = append(eventTypes, eventType)
+	}
+	require.NoError(t, rows.Err())
+	rows.Close()
+	require.Equal(t, []string{"WagerTransactionProcessed", "WalletBalanceChanged"}, eventTypes)
+
+	var publishedCount int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE published_at IS NOT NULL`).Scan(&publishedCount))
+	require.Zero(t, publishedCount, "nothing publishes an outbox row inline — that's the Fase 11 worker's job")
+}
