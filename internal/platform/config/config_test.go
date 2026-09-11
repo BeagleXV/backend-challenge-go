@@ -24,6 +24,8 @@ func validEnv() map[string]string {
 		"POSTGRES_DB":       "wagering",
 		"POSTGRES_USER":     "wagering_app",
 		"POSTGRES_PASSWORD": "s3cret",
+		"OIDC_ISSUER_URL":   "http://localhost:8081/realms/wagering",
+		"OIDC_AUDIENCE":     "wagering-api",
 	}
 }
 
@@ -33,13 +35,14 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 
 	assert.Equal(t, "local", cfg.AppEnv)
 	assert.Equal(t, "info", cfg.LogLevel)
+	assert.Equal(t, ":8080", cfg.HTTPAddr)
 	assert.Equal(t, 15*time.Second, cfg.ShutdownTimeout)
 	assert.Equal(t, "disable", cfg.Postgres.SSLMode)
 	assert.Equal(t, int32(0), cfg.Postgres.MaxConns)
 }
 
-func TestLoad_MissingRequiredPostgresField_FailsFast(t *testing.T) {
-	for _, key := range []string{"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"} {
+func TestLoad_MissingRequiredField_FailsFast(t *testing.T) {
+	for _, key := range []string{"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "OIDC_ISSUER_URL", "OIDC_AUDIENCE"} {
 		t.Run(key, func(t *testing.T) {
 			env := validEnv()
 			delete(env, key)

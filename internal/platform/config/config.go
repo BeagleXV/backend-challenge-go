@@ -39,14 +39,25 @@ func (p Postgres) DSN() string {
 	return u.String()
 }
 
+// OIDC carries the settings needed to validate bearer tokens against an
+// external IdP (Keycloak). There is no default issuer/audience — an API
+// that silently accepted tokens from an unconfigured or wrong issuer would
+// defeat the point of authentication.
+type OIDC struct {
+	IssuerURL string
+	Audience  string
+}
+
 // Config is every setting the process needs at startup. Fields belonging to
-// layers not wired yet (HTTP, SQS, OIDC) are added by the phase that wires
-// them, not speculatively here.
+// layers not wired yet (SQS) are added by the phase that wires them, not
+// speculatively here.
 type Config struct {
 	AppEnv          string
 	ShutdownTimeout time.Duration
 	LogLevel        string
+	HTTPAddr        string
 	Postgres        Postgres
+	OIDC            OIDC
 }
 
 // LookupFunc matches os.LookupEnv's signature, so tests can supply a fake
@@ -61,6 +72,7 @@ func Load(lookup LookupFunc) (*Config, error) {
 	cfg := &Config{
 		AppEnv:   getOr(lookup, "APP_ENV", "local"),
 		LogLevel: getOr(lookup, "LOG_LEVEL", "info"),
+		HTTPAddr: getOr(lookup, "APP_HTTP_ADDR", ":8080"),
 	}
 
 	shutdownTimeout, err := parseDuration(lookup, "APP_SHUTDOWN_TIMEOUT", 15*time.Second)
@@ -75,7 +87,25 @@ func Load(lookup LookupFunc) (*Config, error) {
 	}
 	cfg.Postgres = pgCfg
 
+	oidcCfg, err := loadOIDC(lookup)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OIDC = oidcCfg
+
 	return cfg, nil
+}
+
+func loadOIDC(lookup LookupFunc) (OIDC, error) {
+	issuerURL, err := require(lookup, "OIDC_ISSUER_URL")
+	if err != nil {
+		return OIDC{}, err
+	}
+	audience, err := require(lookup, "OIDC_AUDIENCE")
+	if err != nil {
+		return OIDC{}, err
+	}
+	return OIDC{IssuerURL: issuerURL, Audience: audience}, nil
 }
 
 func loadPostgres(lookup LookupFunc) (Postgres, error) {
