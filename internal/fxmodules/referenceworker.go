@@ -8,6 +8,7 @@ import (
 
 	"github.com/beaglexv/backend-challenge-go/internal/adapters/referenceworker"
 	"github.com/beaglexv/backend-challenge-go/internal/application/resolvependingreference"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // ReferenceWorkerModule registers the pending-reference worker's
@@ -20,8 +21,8 @@ var ReferenceWorkerModule = fx.Module("referenceworker",
 	fx.Invoke(registerReferenceWorker),
 )
 
-func registerReferenceWorker(lc fx.Lifecycle, resolver *resolvependingreference.Service, logger *zap.Logger) {
-	worker := referenceworker.New(resolver, referenceworker.Config{}, logger)
+func registerReferenceWorker(lc fx.Lifecycle, resolver *resolvependingreference.Service, m *metrics.Metrics, logger *zap.Logger) {
+	worker := referenceworker.New(resolver, referenceworker.Config{}, m, logger)
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {

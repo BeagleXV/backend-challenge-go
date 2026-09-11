@@ -10,6 +10,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/adapters/sqsconsumer"
 	"github.com/beaglexv/backend-challenge-go/internal/application/processwagertransaction"
 	"github.com/beaglexv/backend-challenge-go/internal/platform/config"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 	"github.com/beaglexv/backend-challenge-go/internal/platform/sqsclient"
 )
 
@@ -26,10 +27,10 @@ func newSQSClient(cfg *config.Config) (*sqs.Client, error) {
 	return sqsclient.New(context.Background(), cfg.SQS)
 }
 
-func registerConsumer(lc fx.Lifecycle, client *sqs.Client, cfg *config.Config, processor *processwagertransaction.Service, logger *zap.Logger) {
+func registerConsumer(lc fx.Lifecycle, client *sqs.Client, cfg *config.Config, processor *processwagertransaction.Service, m *metrics.Metrics, logger *zap.Logger) {
 	consumer := sqsconsumer.New(client, sqsconsumer.Config{
 		QueueURL: cfg.SQS.WagerTransactionsQueueURL,
-	}, processor, logger)
+	}, processor, m, logger)
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {

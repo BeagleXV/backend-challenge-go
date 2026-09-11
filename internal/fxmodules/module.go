@@ -18,6 +18,11 @@ func All(cfg *config.Config) []fx.Option {
 		PostgresModule,
 		ApplicationModule,
 		IDPModule,
+		// MetricsModule starts early and stops late (its OnStop runs after
+		// every worker's, since fx unwinds OnStop in reverse OnStart
+		// order) — /metrics stays reachable for as much of shutdown as
+		// possible, including while workers below are still draining.
+		MetricsModule,
 		// Every worker module is listed before HTTPAPIModule so its
 		// OnStart hook is appended first: fx runs OnStop in reverse
 		// order, so on shutdown the HTTP listener stops accepting new

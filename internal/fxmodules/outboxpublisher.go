@@ -10,6 +10,7 @@ import (
 	"github.com/beaglexv/backend-challenge-go/internal/adapters/outboxpublisher"
 	"github.com/beaglexv/backend-challenge-go/internal/application/ports"
 	"github.com/beaglexv/backend-challenge-go/internal/platform/config"
+	"github.com/beaglexv/backend-challenge-go/internal/platform/metrics"
 )
 
 // OutboxPublisherModule provides the ports.EventPublisher (SQS-backed,
@@ -26,8 +27,8 @@ func asEventPublisher(client *sqs.Client, cfg *config.Config) ports.EventPublish
 	return outboxpublisher.NewSQSPublisher(client, cfg.SQS.EventsQueueURL)
 }
 
-func registerOutboxPublisher(lc fx.Lifecycle, uow ports.UnitOfWork, outbox ports.OutboxRepository, publisher ports.EventPublisher, logger *zap.Logger) {
-	worker := outboxpublisher.New(uow, outbox, publisher, outboxpublisher.Config{}, logger)
+func registerOutboxPublisher(lc fx.Lifecycle, uow ports.UnitOfWork, outbox ports.OutboxRepository, publisher ports.EventPublisher, m *metrics.Metrics, logger *zap.Logger) {
+	worker := outboxpublisher.New(uow, outbox, publisher, outboxpublisher.Config{}, m, logger)
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {

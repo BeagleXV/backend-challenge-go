@@ -14,11 +14,7 @@ import (
 )
 
 // HTTPAPIModule provides the chi router and starts/stops the HTTP server
-// through fx.Lifecycle. Depending on httpapi.NewRouter's full parameter
-// list is what finally makes BootstrapModule's forced invoke redundant —
-// listening for real traffic is itself the thing that needs every
-// service — but bootstrap.go is left in place for now since Phases 8-11
-// still need it to force-build the SQS/worker side of the graph.
+// through fx.Lifecycle.
 var HTTPAPIModule = fx.Module("httpapi",
 	fx.Provide(httpapi.NewRouter),
 	fx.Invoke(registerHTTPServer),
