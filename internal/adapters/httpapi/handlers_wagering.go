@@ -65,17 +65,10 @@ func (h *wageringHandlers) submitHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	hash, err := payloadHash(req)
-	if err != nil {
-		writeUnexpectedError(w, r, h.logger, "wagering_submit", err)
-		return
-	}
-
 	result, err := h.processor.Handle(r.Context(), processwagertransaction.Request{
 		IdempotencyKey:                 idempotencyKey,
 		ProviderID:                     req.ProviderID,
 		ExternalTransactionID:          req.ExternalTransactionID,
-		PayloadHash:                    hash,
 		WalletID:                       req.WalletID,
 		PlayerID:                       req.PlayerID,
 		RoundID:                        req.RoundID,

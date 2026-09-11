@@ -64,7 +64,6 @@ func baseRequest(walletID uuid.UUID, kind wagertransaction.Kind, amount string) 
 		IdempotencyKey:        "provider-a:" + uuid.NewString(),
 		ProviderID:            "provider-a",
 		ExternalTransactionID: uuid.NewString(),
-		PayloadHash:           "hash-" + uuid.NewString(),
 		WalletID:              walletID,
 		PlayerID:              uuid.New(),
 		RoundID:               "round-1",
@@ -175,8 +174,11 @@ func TestHandle_IdempotencyConflict_SameKeyDifferentPayload(t *testing.T) {
 	_, err := h.svc.Handle(context.Background(), req)
 	require.NoError(t, err)
 
+	// Same idempotency key, but a different business field (amount) — the
+	// canonical hash naturally differs, without either side ever setting
+	// a hash by hand.
 	req2 := req
-	req2.PayloadHash = "different-hash"
+	req2.Amount = mustMoney(t, "26.00")
 	_, err = h.svc.Handle(context.Background(), req2)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, processwagertransaction.ErrIdempotencyConflict))
@@ -193,7 +195,6 @@ func TestHandle_ExternalIDReusedWithDifferentKey_Rejected(t *testing.T) {
 
 	req2 := req
 	req2.IdempotencyKey = "a-completely-different-key"
-	req2.PayloadHash = "different-hash-too"
 	_, err = h.svc.Handle(context.Background(), req2)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, processwagertransaction.ErrExternalIDReused))

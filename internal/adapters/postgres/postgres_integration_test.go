@@ -427,7 +427,6 @@ func TestProcessWagerTransaction_SameBetSentFiftyTimesInParallel_SingleDebit(t *
 		IdempotencyKey:        "provider-a:bet-parallel-1",
 		ProviderID:            "provider-a",
 		ExternalTransactionID: "bet-parallel-1",
-		PayloadHash:           "hash-1",
 		WalletID:              walletID,
 		PlayerID:              uuid.New(),
 		RoundID:               "round-1",

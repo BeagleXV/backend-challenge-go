@@ -57,11 +57,15 @@ type InboxInfo struct {
 
 // Request is the input already normalized by the caller (HTTP handler or
 // SQS consumer) — this use case does not know or care which one it was.
+// There is deliberately no PayloadHash field: Handle computes it itself,
+// via CanonicalHash, from Request's own business fields — a caller cannot
+// supply a wrong or inconsistently-normalized hash, and HTTP and SQS are
+// structurally unable to diverge in what they consider the same
+// operation.
 type Request struct {
 	IdempotencyKey                 string
 	ProviderID                     string
 	ExternalTransactionID          string
-	PayloadHash                    string
 	WalletID                       uuid.UUID
 	PlayerID                       uuid.UUID
 	RoundID                        string
@@ -124,9 +128,6 @@ func validateRequest(req Request) error {
 	if req.IdempotencyKey == "" {
 		return fmt.Errorf("%w: idempotencyKey is required", ErrInvalidRequest)
 	}
-	if req.PayloadHash == "" {
-		return fmt.Errorf("%w: payloadHash is required", ErrInvalidRequest)
-	}
 	if req.ProviderID == "" || req.ExternalTransactionID == "" {
 		return fmt.Errorf("%w: providerID and externalTransactionID are required", ErrInvalidRequest)
 	}
@@ -164,6 +165,8 @@ func (s *Service) Handle(ctx context.Context, req Request) (Result, error) {
 }
 
 func (s *Service) handleOnce(ctx context.Context, req Request) (Result, error) {
+	hash := CanonicalHash(req)
+
 	var result Result
 	err := s.uow.WithinTx(ctx, func(ctx context.Context) error {
 		if req.Inbox != nil {
@@ -190,7 +193,7 @@ func (s *Service) handleOnce(ctx context.Context, req Request) (Result, error) {
 			return fmt.Errorf("lookup by idempotency key: %w", err)
 		}
 		if existing != nil {
-			if existing.PayloadHash() != req.PayloadHash {
+			if existing.PayloadHash() != hash {
 				return ErrIdempotencyConflict
 			}
 			result = resultFromExisting(existing)
@@ -219,7 +222,7 @@ func (s *Service) handleOnce(ctx context.Context, req Request) (Result, error) {
 			ProviderID:                     req.ProviderID,
 			ExternalTransactionID:          req.ExternalTransactionID,
 			IdempotencyKey:                 req.IdempotencyKey,
-			PayloadHash:                    req.PayloadHash,
+			PayloadHash:                    hash,
 			WalletID:                       req.WalletID,
 			PlayerID:                       req.PlayerID,
 			RoundID:                        req.RoundID,
