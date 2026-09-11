@@ -149,7 +149,21 @@ Todo evento de domínio (`WagerTransactionProcessed`, `WagerTransactionRejected`
 
 ## 10. Uber Fx e shutdown
 
-*A ser detalhado: organização dos módulos, ordem de inicialização/encerramento, comportamento sob `SIGTERM`.*
+Um `fx.Module` por camada, em `internal/fxmodules/`, agregados por `All(cfg)` e consumidos por `cmd/api/main.go`:
+
+- `config` — não tem construtor; apenas `fx.Supply` do `*config.Config` já carregado e validado por `config.Load` **antes** de `fx.New` ser chamado. Isso significa que uma variável de ambiente obrigatória ausente falha o processo com uma mensagem simples em stderr, sem nem montar o grafo de dependências do dig — mais rápido de diagnosticar do que deixar o fail-fast acontecer dentro de um `OnStart`.
+- `logging` — provê o `*zap.Logger` (nível e encoder derivados de `LOG_LEVEL`/`APP_ENV`) e registra `OnStop` para `logger.Sync()` (erro ignorado deliberadamente — sync de stdout/stderr em terminal/pipe no Linux costuma retornar ENOTTY/EINVAL, o que não é uma falha real).
+- `postgres` — `newPool` abre o `*pgxpool.Pool` a partir de `cfg.Postgres.DSN()` e registra `OnStart` fazendo `pool.Ping(ctx)` (conecta e valida credenciais/rede no start, não na primeira requisição) e `OnStop` fazendo `pool.Close()`. Os cinco `ports.*Repository` e o `ports.UnitOfWork` são providos como as interfaces da camada de aplicação (nunca o tipo concreto do adapter), via funções `asXxx` — mantém a application layer livre de import de `internal/adapters/postgres`.
+- `application` — provê `ports.Clock`/`ports.IDGenerator` reais (`internal/platform/clock`, `internal/platform/idgen`) e os quatro serviços de caso de uso (`openwallet`, `processwagertransaction`, `reconciliation`, `resolvependingreference`) como singletons compartilhados — é o mesmo `*processwagertransaction.Service` que HTTP (Fase 6) e o consumidor SQS (Fase 9) vão chamar.
+- `bootstrap` — um único `fx.Invoke` que depende do logger e dos quatro serviços, só para forçar o dig a construir o grafo inteiro (sem isso, nada nesta fase referencia os `fx.Provide`, e eles nunca seriam instanciados — nem os hooks de lifecycle registrados). Registra os logs de start/stop de topo. Este módulo é temporário: a partir da Fase 6/8-11, o servidor HTTP e os workers passam a depender diretamente dos serviços, e este invoke deve ser removido em vez de mantido ao lado deles.
+
+Ordem de shutdown obtida (fx desfaz `OnStop` na ordem inversa em que os `OnStart`/construtores rodaram): `bootstrap` → pool Postgres → sync do logger. Como ainda não existem HTTP/SQS/workers, a ordem completa do desafio original (HTTP listener → workers → conexões) só passa a se aplicar a partir da Fase 6 em diante — cada fase nova entra nessa cadeia na posição correta porque fx constrói na ordem de dependência, não na ordem de registro dos módulos.
+
+`fx.StopTimeout(cfg.ShutdownTimeout)` limita quanto tempo o processo espera por todos os `OnStop` durante um `SIGTERM`/`SIGINT` — evita travar para sempre esperando um worker que nunca drena. Não há `fx.StartTimeout` explícito nesta fase (nenhum `OnStart` faz I/O de longa duração além do ping ao Postgres).
+
+Testado manualmente subindo `docker compose up -d postgres`, rodando o binário compilado e enviando `SIGTERM`: log de `wagering-api started` após o ping do pool ter sucesso, e na sequência `wagering-api stopping` → pool fechado → logger sincronizado, saindo com código 0.
+
+Domínio (`internal/domain/**`) confirmado sem nenhum import de `go.uber.org/fx`.
 
 ## 11. Observabilidade
 
