@@ -171,6 +171,10 @@ type OutboxRepository interface {
 // EventPublisher is the port the outbox worker (Fase 11) depends on to
 // actually deliver an event to its destination (SQS). Use cases in this
 // package never call it directly — they only ever write to the outbox.
+// eventID and aggregateID are passed explicitly (rather than left for the
+// publisher to parse back out of payload) so a FIFO-queue-backed
+// implementation can use them as MessageDeduplicationId/MessageGroupId
+// without re-decoding JSON it didn't produce.
 type EventPublisher interface {
-	Publish(ctx context.Context, eventType string, payload []byte) error
+	Publish(ctx context.Context, eventID, aggregateID uuid.UUID, eventType string, payload []byte) error
 }

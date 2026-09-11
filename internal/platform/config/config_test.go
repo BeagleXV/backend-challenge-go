@@ -28,6 +28,7 @@ func validEnv() map[string]string {
 		"OIDC_AUDIENCE":                    "wagering-api",
 		"AWS_REGION":                       "us-east-1",
 		"SQS_WAGER_TRANSACTIONS_QUEUE_URL": "http://localhost:4566/000000000000/wager-transactions.fifo",
+		"SQS_EVENTS_QUEUE_URL":             "http://localhost:4566/000000000000/wager-events.fifo",
 	}
 }
 
@@ -44,7 +45,7 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 }
 
 func TestLoad_MissingRequiredField_FailsFast(t *testing.T) {
-	for _, key := range []string{"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "OIDC_ISSUER_URL", "OIDC_AUDIENCE", "AWS_REGION", "SQS_WAGER_TRANSACTIONS_QUEUE_URL"} {
+	for _, key := range []string{"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "OIDC_ISSUER_URL", "OIDC_AUDIENCE", "AWS_REGION", "SQS_WAGER_TRANSACTIONS_QUEUE_URL", "SQS_EVENTS_QUEUE_URL"} {
 		t.Run(key, func(t *testing.T) {
 			env := validEnv()
 			delete(env, key)

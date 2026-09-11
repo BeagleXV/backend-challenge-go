@@ -48,20 +48,21 @@ type OIDC struct {
 	Audience  string
 }
 
-// SQS carries the settings needed to reach the wager-transactions queue.
-// AccessKeyID/SecretAccessKey/Endpoint are all optional: unset, the AWS
-// SDK falls back to its default credential chain (IAM role, shared config,
-// env vars it reads itself) and the real AWS endpoint for Region — exactly
-// what a real deployment wants. Set, they point the client at LocalStack
-// with its static test credentials for local development. Either way,
-// credentials only ever come from config/environment, never a literal in
-// source.
+// SQS carries the settings needed to reach the wager-transactions and
+// wager-events queues. AccessKeyID/SecretAccessKey/Endpoint are all
+// optional: unset, the AWS SDK falls back to its default credential chain
+// (IAM role, shared config, env vars it reads itself) and the real AWS
+// endpoint for Region — exactly what a real deployment wants. Set, they
+// point the client at LocalStack with its static test credentials for
+// local development. Either way, credentials only ever come from
+// config/environment, never a literal in source.
 type SQS struct {
 	Region                    string
 	Endpoint                  string
 	AccessKeyID               string
 	SecretAccessKey           string
 	WagerTransactionsQueueURL string
+	EventsQueueURL            string
 }
 
 // Config is every setting the process needs at startup.
@@ -126,12 +127,17 @@ func loadSQS(lookup LookupFunc) (SQS, error) {
 	if err != nil {
 		return SQS{}, err
 	}
+	eventsQueueURL, err := require(lookup, "SQS_EVENTS_QUEUE_URL")
+	if err != nil {
+		return SQS{}, err
+	}
 	return SQS{
 		Region:                    region,
 		Endpoint:                  getOr(lookup, "SQS_ENDPOINT", ""),
 		AccessKeyID:               getOr(lookup, "AWS_ACCESS_KEY_ID", ""),
 		SecretAccessKey:           getOr(lookup, "AWS_SECRET_ACCESS_KEY", ""),
 		WagerTransactionsQueueURL: queueURL,
+		EventsQueueURL:            eventsQueueURL,
 	}, nil
 }
 
