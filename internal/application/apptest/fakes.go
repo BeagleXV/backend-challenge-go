@@ -521,6 +521,7 @@ type OutboxEvent struct {
 	Attempts    int
 	PublishedAt *time.Time
 	LockedBy    string
+	LockedAt    time.Time
 }
 
 // OutboxRepository is an in-memory ports.OutboxRepository.
@@ -546,16 +547,32 @@ func (r *OutboxRepository) Enqueue(ctx context.Context, eventID, aggregateID uui
 	return nil
 }
 
+// ClaimBatch mirrors the Postgres adapter's semantics: a row already
+// locked is only skipped while its lock is still fresh
+// (now - lockedAt < lockDuration) — an abandoned lock (crashed publisher,
+// or a failed publish attempt that never called MarkPublished) becomes
+// reclaimable, by this or any other instance, once it goes stale. There is
+// deliberately no real mutual exclusion here beyond the mutex around the
+// whole method — that's the same guarantee the real SKIP LOCKED gives
+// only within a single already-open transaction, which is exactly what
+// this fake, called without one, cannot reproduce; concurrent-dispute
+// correctness is proven against real Postgres instead (Fase 11 integration
+// test).
 func (r *OutboxRepository) ClaimBatch(ctx context.Context, limit int, lockedBy string, lockDuration time.Duration) ([]ports.OutboxRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	var out []ports.OutboxRecord
 	for i := range r.Events {
 		e := &r.Events[i]
-		if e.PublishedAt != nil || e.LockedBy != "" {
+		if e.PublishedAt != nil {
+			continue
+		}
+		if e.LockedBy != "" && now.Sub(e.LockedAt) < lockDuration {
 			continue
 		}
 		e.LockedBy = lockedBy
+		e.LockedAt = now
 		e.Attempts++
 		out = append(out, ports.OutboxRecord{
 			EventID:     e.EventID,
