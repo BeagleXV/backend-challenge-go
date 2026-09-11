@@ -26,6 +26,7 @@ func All(cfg *config.Config) []fx.Option {
 		// connections) rather than an arbitrary one.
 		SQSConsumerModule,
 		ReferenceWorkerModule,
+		OutboxPublisherModule,
 		HTTPAPIModule,
 		fx.StopTimeout(cfg.ShutdownTimeout),
 	}
