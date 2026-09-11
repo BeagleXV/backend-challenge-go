@@ -124,6 +124,13 @@ type InboxRepository interface {
 	// result).
 	TryInsert(ctx context.Context, msg InboxMessage) (alreadyExists bool, err error)
 	MarkCompleted(ctx context.Context, consumerName, messageID string, completedAt time.Time) error
+	// Get returns the previously recorded message for (consumerName,
+	// messageID). Used only when TryInsert reports alreadyExists, to check
+	// the redelivered message's Hash still matches what was originally
+	// recorded — catching a reused messageID whose content silently
+	// changed (a producer or queue bug), which is not a normal replay.
+	// Returns ErrNotFound if no such record exists.
+	Get(ctx context.Context, consumerName, messageID string) (InboxMessage, error)
 }
 
 // OutboxRecord is a pending (or previously attempted) outbox row, as read

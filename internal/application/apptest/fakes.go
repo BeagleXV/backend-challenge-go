@@ -470,6 +470,16 @@ func (r *InboxRepository) TryInsert(ctx context.Context, msg ports.InboxMessage)
 	return false, nil
 }
 
+func (r *InboxRepository) Get(ctx context.Context, consumerName, messageID string) (ports.InboxMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	row, ok := r.rows[inboxKey(consumerName, messageID)]
+	if !ok {
+		return ports.InboxMessage{}, fmt.Errorf("inbox message %s/%s: %w", consumerName, messageID, ports.ErrNotFound)
+	}
+	return row.msg, nil
+}
+
 func (r *InboxRepository) MarkCompleted(ctx context.Context, consumerName, messageID string, completedAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -44,6 +44,14 @@ var (
 	ErrWalletNotFound      = errors.New("processwagertransaction: wallet not found")
 	ErrUnsupportedKind     = errors.New("processwagertransaction: unsupported kind")
 	ErrNotPendingReference = errors.New("processwagertransaction: transaction is not PENDING_REFERENCE")
+	// ErrInboxHashMismatch signals a redelivered message whose content
+	// hash no longer matches what was recorded under the same messageID
+	// on first delivery — a reused id with silently different content,
+	// never a normal at-least-once redelivery. Callers (the SQS consumer)
+	// must not treat this as a replay: log it and leave the message for
+	// SQS's own redrive policy to route to the DLQ after exhausting
+	// retries, the same as any other Handle error.
+	ErrInboxHashMismatch = errors.New("processwagertransaction: redelivered message hash does not match the original")
 )
 
 // InboxInfo carries SQS message identity for durable deduplication. Left
@@ -179,6 +187,13 @@ func (s *Service) handleOnce(ctx context.Context, req Request) (Result, error) {
 				return fmt.Errorf("inbox insert: %w", err)
 			}
 			if alreadyExists {
+				stored, err := s.inbox.Get(ctx, req.Inbox.ConsumerName, req.Inbox.MessageID)
+				if err != nil {
+					return fmt.Errorf("inbox get: %w", err)
+				}
+				if stored.Hash != req.Inbox.Hash {
+					return ErrInboxHashMismatch
+				}
 				r, err := s.loadExistingResult(ctx, req.IdempotencyKey)
 				if err != nil {
 					return err

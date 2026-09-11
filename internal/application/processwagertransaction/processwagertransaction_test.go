@@ -275,6 +275,33 @@ func TestHandle_Refund_ReferenceNotFound_MarksPendingReference(t *testing.T) {
 	require.Equal(t, "100.00", w.Balance().String(), "wallet must not move while reference is pending")
 }
 
+// TestHandle_InboxRedelivery_HashMismatch_Rejected covers the "recalcula/
+// verifica hash em reentregas" requirement: a redelivery carrying the same
+// messageID as a message already recorded, but a different content hash,
+// is not a normal at-least-once replay — it signals a reused id with
+// silently different content — and must be rejected outright rather than
+// answered with whatever the first delivery produced.
+func TestHandle_InboxRedelivery_HashMismatch_Rejected(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	req := baseRequest(walletID, wagertransaction.KindBet, "25.00")
+	req.Amount = mustMoney(t, "25.00")
+	req.Inbox = &processwagertransaction.InboxInfo{
+		ConsumerName: "wager-consumer",
+		MessageID:    "msg-hash-mismatch-1",
+		Hash:         "original-hash",
+	}
+
+	_, err := h.svc.Handle(context.Background(), req)
+	require.NoError(t, err)
+
+	req.Inbox.Hash = "a-different-hash"
+	_, err = h.svc.Handle(context.Background(), req)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, processwagertransaction.ErrInboxHashMismatch))
+}
+
 // TestHandle_PendingReference_CompletesInboxMessageButStaysPending covers
 // the Fase 8 special case: an SQS-originated operation that lands in
 // PENDING_REFERENCE still completes its inbox message in the very same

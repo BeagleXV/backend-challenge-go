@@ -37,6 +37,18 @@ func (r *InboxRepository) TryInsert(ctx context.Context, msg ports.InboxMessage)
 	return tag.RowsAffected() == 0, nil
 }
 
+func (r *InboxRepository) Get(ctx context.Context, consumerName, messageID string) (ports.InboxMessage, error) {
+	var msg ports.InboxMessage
+	err := q(ctx, r.pool).QueryRow(ctx,
+		`SELECT consumer_name, message_id, hash FROM inbox_messages WHERE consumer_name = $1 AND message_id = $2`,
+		consumerName, messageID,
+	).Scan(&msg.ConsumerName, &msg.MessageID, &msg.Hash)
+	if err != nil {
+		return ports.InboxMessage{}, mapErr(err, "inbox.Get")
+	}
+	return msg, nil
+}
+
 func (r *InboxRepository) MarkCompleted(ctx context.Context, consumerName, messageID string, completedAt time.Time) error {
 	tag, err := q(ctx, r.pool).Exec(ctx,
 		`UPDATE inbox_messages SET completed_at = $3 WHERE consumer_name = $1 AND message_id = $2`,
