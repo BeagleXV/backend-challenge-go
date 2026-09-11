@@ -1,8 +1,6 @@
 // Package fxmodules wires the application via Uber Fx. Each file is one
 // fx.Module per layer (config, logging, postgres, application, ...); All
-// aggregates them for cmd/api/main.go. HTTP, SQS and worker modules are
-// added by the phases that implement those adapters (6, 8-11) — until
-// then, BootstrapModule is what forces the graph to build.
+// aggregates them for cmd/api/main.go.
 package fxmodules
 
 import (
@@ -20,15 +18,15 @@ func All(cfg *config.Config) []fx.Option {
 		PostgresModule,
 		ApplicationModule,
 		IDPModule,
-		// SQSConsumerModule is listed before HTTPAPIModule so its OnStart
-		// hook is appended first: fx runs OnStop in reverse order, so on
-		// shutdown the HTTP listener stops accepting new requests before
-		// the SQS consumer stops pulling new messages, matching the
-		// README's documented order (HTTP listener → workers →
+		// Every worker module is listed before HTTPAPIModule so its
+		// OnStart hook is appended first: fx runs OnStop in reverse
+		// order, so on shutdown the HTTP listener stops accepting new
+		// requests before any worker stops pulling new work, matching
+		// the README's documented order (HTTP listener → workers →
 		// connections) rather than an arbitrary one.
 		SQSConsumerModule,
+		ReferenceWorkerModule,
 		HTTPAPIModule,
-		BootstrapModule,
 		fx.StopTimeout(cfg.ShutdownTimeout),
 	}
 }
