@@ -283,6 +283,8 @@ Um `fx.Module` por camada, em `internal/fxmodules/`, agregados por `All(cfg)` e 
 
 Domínio (`internal/domain/**`) confirmado sem nenhum import de `go.uber.org/fx`.
 
+**Prova de composição contra infraestrutura real (Fase 15):** `internal/integration/fxapp_test.go` (`TestFxApp_StartAndStop_CleanShutdown`, build tag `integration`) monta `fxmodules.All(cfg)` — a lista exata que `cmd/api/main.go` usa — apontado para Postgres, LocalStack e Keycloak reais via testcontainers, e chama `app.Start`/`app.Stop` de verdade. `internal/integration/e2e_test.go`'s `TestEndToEnd_RestartRecovery_PendingOutboxEventIsPublishedByFreshInstance` vai além: sobe uma primeira instância, deixa ela processar uma aposta (que grava outbox events na mesma transação da mudança de domínio), derruba essa instância e sobe uma **segunda** instância `fx.New` inteiramente nova contra o mesmo Postgres/LocalStack — e confirma que o publisher da nova instância entrega os eventos deixados pela primeira. Isso prova, contra infraestrutura real e não apenas por inspeção do código, a garantia arquitetural central do sistema: nenhum estado que precisa sobreviver a um restart do processo (outbox pendente, referência pendente, resultado idempotente) vive só em memória — tudo está em Postgres/SQS, então qualquer instância nova retoma exatamente de onde a anterior parou.
+
 ## 14. Observabilidade
 
 ### Logs
