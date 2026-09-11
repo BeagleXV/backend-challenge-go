@@ -533,18 +533,103 @@ func (s *Service) applyReversal(ctx context.Context, pc *processCtx) (Result, er
 	return s.commitMovement(ctx, pc, direction, before, after)
 }
 
+// markPendingReference is reached both the first time a reversal's
+// reference can't be resolved yet (called from Handle, tx still PENDING)
+// and on every subsequent retry the pending-reference worker (Fase 10)
+// makes via Resume (tx already PENDING_REFERENCE) — Resume/applyReversal
+// never decide to give up on their own; only the worker's own
+// attempts/TTL policy does that, via ExpirePendingReference.
 func (s *Service) markPendingReference(ctx context.Context, pc *processCtx) (Result, error) {
 	now := s.clock.Now()
-	if err := pc.tx.MarkPendingReference(now); err != nil {
-		return Result{}, err
+	firstAttempt := pc.tx.Status() != wagertransaction.StatusPendingReference
+
+	if firstAttempt {
+		if err := pc.tx.MarkPendingReference(now, now.Add(pendingReferenceBackoff(1))); err != nil {
+			return Result{}, err
+		}
+	} else {
+		nextAttempt := pc.tx.PendingReferenceAttempts() + 1
+		if err := pc.tx.RecordPendingReferenceRetry(now, now.Add(pendingReferenceBackoff(nextAttempt))); err != nil {
+			return Result{}, err
+		}
 	}
+
 	if err := s.txs.Update(ctx, pc.tx); err != nil {
 		return Result{}, fmt.Errorf("update wager transaction: %w", err)
 	}
-	if err := s.enqueuePendingReferenceEvent(ctx, pc); err != nil {
-		return Result{}, err
+	// Emitted once, on the first entry into PENDING_REFERENCE — a repeat
+	// event on every retry would just say "still waiting" over and over
+	// without new information, and could confuse a consumer expecting one
+	// event per meaningful state change.
+	if firstAttempt {
+		if err := s.enqueuePendingReferenceEvent(ctx, pc); err != nil {
+			return Result{}, err
+		}
 	}
 	return Result{TransactionID: pc.tx.ID(), Status: pc.tx.Status()}, nil
+}
+
+// pendingReferenceBackoff returns the delay before pending-reference
+// resolution attempt number `attempt` (1-indexed), exponential with a cap
+// — a reference that never arrives doesn't get hammered at a fixed
+// interval forever, but also doesn't wait unboundedly long between tries.
+// The shift is clamped so this can never overflow for a large attempt
+// count; the cap makes the clamp irrelevant anyway (30s<<6 = 32min already
+// exceeds it).
+func pendingReferenceBackoff(attempt int) time.Duration {
+	const (
+		base = 30 * time.Second
+		cap_ = 30 * time.Minute
+	)
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 6 {
+		shift = 6
+	}
+	d := base * time.Duration(1<<uint(shift))
+	if d > cap_ {
+		d = cap_
+	}
+	return d
+}
+
+// ExpirePendingReference forcibly rejects a PENDING_REFERENCE transaction
+// that has exhausted its retry budget — a policy decision (max attempts,
+// TTL, or both) that belongs entirely to the pending-reference worker
+// (Fase 10), never to Resume/applyReversal, which have no way to know how
+// many attempts is "enough". Reuses reject() exactly as any other business
+// rejection would: result balance snapshot, ledger untouched (no
+// movement), WagerTransactionRejected event via the outbox.
+func (s *Service) ExpirePendingReference(ctx context.Context, transactionID uuid.UUID, correlationID string) (Result, error) {
+	var result Result
+	err := s.uow.WithinTx(ctx, func(ctx context.Context) error {
+		tx, err := s.txs.GetForUpdate(ctx, transactionID)
+		if err != nil {
+			return fmt.Errorf("load wager transaction: %w", err)
+		}
+		if tx.Status() != wagertransaction.StatusPendingReference {
+			return fmt.Errorf("%w: %s is %s", ErrNotPendingReference, transactionID, tx.Status())
+		}
+
+		w, err := s.wallets.GetForUpdate(ctx, tx.WalletID())
+		if err != nil {
+			return fmt.Errorf("load wallet: %w", err)
+		}
+
+		pc := &processCtx{wallet: w, tx: tx, correlationID: correlationIDOrFallback(correlationID, tx.ID())}
+		r, err := s.reject(ctx, pc, FailureCodeReferenceNotFound)
+		if err != nil {
+			return err
+		}
+		result = r
+		return nil
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return result, nil
 }
 
 func (s *Service) completeInbox(ctx context.Context, inbox *InboxInfo) error {

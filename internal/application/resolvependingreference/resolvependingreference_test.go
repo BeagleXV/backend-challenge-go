@@ -64,7 +64,8 @@ func TestResolve_ReferenceArrivedLate_NowProcesses(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, wagertransaction.StatusPendingReference, pendingResult.Status)
 
-	ready, err := svc.ListReady(context.Background(), 10)
+	readyAt := clock.T.Add(time.Hour)
+	ready, err := svc.ListReady(context.Background(), readyAt, 10)
 	require.NoError(t, err)
 	require.Len(t, ready, 1)
 	require.Equal(t, pendingResult.TransactionID, ready[0].ID())
@@ -92,7 +93,7 @@ func TestResolve_ReferenceArrivedLate_NowProcesses(t *testing.T) {
 	require.Equal(t, wagertransaction.StatusProcessed, resumed.Status)
 	require.Equal(t, "100.00", resumed.Balance.String())
 
-	ready, err = svc.ListReady(context.Background(), 10)
+	ready, err = svc.ListReady(context.Background(), readyAt, 10)
 	require.NoError(t, err)
 	require.Empty(t, ready, "no more PENDING_REFERENCE transactions left")
 }

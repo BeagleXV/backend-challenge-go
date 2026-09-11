@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/beaglexv/backend-challenge-go/internal/application/apptest"
@@ -273,6 +274,116 @@ func TestHandle_Refund_ReferenceNotFound_MarksPendingReference(t *testing.T) {
 	w, err := h.wallets.GetByID(context.Background(), walletID)
 	require.NoError(t, err)
 	require.Equal(t, "100.00", w.Balance().String(), "wallet must not move while reference is pending")
+}
+
+func TestHandle_Refund_ReferenceNotFound_SchedulesFirstAttempt(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	refund := baseRequest(walletID, wagertransaction.KindRefund, "25.00")
+	refund.Amount = mustMoney(t, "25.00")
+	refund.ReferenceExternalTransactionID = "does-not-exist"
+
+	result, err := h.svc.Handle(context.Background(), refund)
+	require.NoError(t, err)
+
+	tx, err := h.txs.GetByID(context.Background(), result.TransactionID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, tx.PendingReferenceAttempts())
+	next, ok := tx.PendingReferenceNextAttemptAt()
+	require.True(t, ok)
+	assert.Equal(t, tx.UpdatedAt().Add(30*time.Second), next, "first attempt schedules a 30s backoff")
+}
+
+func TestResume_StillNotFound_IncrementsAttemptsAndBacksOffExponentially(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	refund := baseRequest(walletID, wagertransaction.KindRefund, "25.00")
+	refund.Amount = mustMoney(t, "25.00")
+	refund.ReferenceExternalTransactionID = "does-not-exist"
+	first, err := h.svc.Handle(context.Background(), refund)
+	require.NoError(t, err)
+
+	wantBackoffs := []time.Duration{60 * time.Second, 120 * time.Second, 240 * time.Second}
+	for i, want := range wantBackoffs {
+		result, err := h.svc.Resume(context.Background(), first.TransactionID, "corr-retry")
+		require.NoError(t, err, "retry %d", i)
+		require.Equal(t, wagertransaction.StatusPendingReference, result.Status, "retry %d", i)
+
+		tx, err := h.txs.GetByID(context.Background(), first.TransactionID)
+		require.NoError(t, err)
+		assert.Equal(t, i+2, tx.PendingReferenceAttempts(), "retry %d", i)
+		next, ok := tx.PendingReferenceNextAttemptAt()
+		require.True(t, ok)
+		assert.Equal(t, tx.UpdatedAt().Add(want), next, "retry %d backoff", i)
+	}
+}
+
+func TestResume_Backoff_CapsAtThirtyMinutes(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	refund := baseRequest(walletID, wagertransaction.KindRefund, "25.00")
+	refund.Amount = mustMoney(t, "25.00")
+	refund.ReferenceExternalTransactionID = "does-not-exist"
+	first, err := h.svc.Handle(context.Background(), refund)
+	require.NoError(t, err)
+
+	var last processwagertransaction.Result
+	for i := 0; i < 8; i++ {
+		last, err = h.svc.Resume(context.Background(), first.TransactionID, "corr-retry")
+		require.NoError(t, err)
+	}
+	require.Equal(t, wagertransaction.StatusPendingReference, last.Status)
+
+	tx, err := h.txs.GetByID(context.Background(), first.TransactionID)
+	require.NoError(t, err)
+	next, ok := tx.PendingReferenceNextAttemptAt()
+	require.True(t, ok)
+	assert.Equal(t, tx.UpdatedAt().Add(30*time.Minute), next, "backoff must not keep growing past the cap")
+}
+
+func TestExpirePendingReference_RejectsWithReferenceNotFoundCode(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	refund := baseRequest(walletID, wagertransaction.KindRefund, "25.00")
+	refund.Amount = mustMoney(t, "25.00")
+	refund.ReferenceExternalTransactionID = "does-not-exist"
+	first, err := h.svc.Handle(context.Background(), refund)
+	require.NoError(t, err)
+
+	result, err := h.svc.ExpirePendingReference(context.Background(), first.TransactionID, "corr-expire")
+	require.NoError(t, err)
+	assert.Equal(t, wagertransaction.StatusRejected, result.Status)
+	assert.Equal(t, processwagertransaction.FailureCodeReferenceNotFound, result.FailureCode)
+	require.True(t, result.HasBalance)
+	assert.Equal(t, "100.00", result.Balance.String(), "expiry never moves the wallet")
+
+	tx, err := h.txs.GetByID(context.Background(), first.TransactionID)
+	require.NoError(t, err)
+	_, ok := tx.PendingReferenceNextAttemptAt()
+	assert.False(t, ok, "a terminal transaction has no next attempt scheduled")
+
+	entries, err := h.ledgers.ListByWallet(context.Background(), walletID)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "expiry produces no ledger entry")
+}
+
+func TestExpirePendingReference_RequiresPendingReferenceStatus(t *testing.T) {
+	h := newHarness()
+	walletID := h.seedWallet(t, "100.00")
+
+	req := baseRequest(walletID, wagertransaction.KindBet, "25.00")
+	req.Amount = mustMoney(t, "25.00")
+	result, err := h.svc.Handle(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, wagertransaction.StatusProcessed, result.Status)
+
+	_, err = h.svc.ExpirePendingReference(context.Background(), result.TransactionID, "corr-expire")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, processwagertransaction.ErrNotPendingReference))
 }
 
 // TestHandle_InboxRedelivery_HashMismatch_Rejected covers the "recalcula/
