@@ -131,6 +131,14 @@ Abra `http://localhost:8082`. É só documentação — o serviço fica atrás d
 docker compose --profile docs down   # derrubar só o swagger-ui
 ```
 
+### Collection para Postman/Insomnia
+
+Em [`docs/api-collection/`](docs/api-collection/): `wagering-api.postman_collection.json` (17 requisições — obtenção de token para as 4 identidades de teste, todas as rotas de carteira e de operações incluindo os 5 `kind`, health checks) e `wagering-api.postman_environment.json` (variáveis: `baseUrl`, `keycloakUrl`, credenciais das identidades de teste). Importe os dois no Postman, ou só a collection no Insomnia (que também lê o formato Postman nativamente).
+
+As requisições de "Auth" salvam o token na variável de ambiente automaticamente (`internalToken`, `providerAToken`, etc.) via script de teste — assim como "Open wallet" salva `walletId` e "Submit BET" salva `transactionId`, para encadear as chamadas seguintes sem copiar nada manualmente. Suporte a esses scripts é nativo no Postman; no Insomnia pode ser parcial — se um valor não for preenchido sozinho, copie-o da resposta para a variável de ambiente correspondente.
+
+Pré-requisito: a API rodando no host (`make run`), não via `docker compose up --build app` — o `keycloakUrl` do ambiente aponta para a porta publicada no host (`localhost:8081`), a mesma que a API usa como `OIDC_ISSUER_URL` nesse modo (ver "Rodando a aplicação localmente" acima). Testado de ponta a ponta nesta sessão com `newman` (Postman/Insomnia usam o mesmo motor de execução): as 17 requisições passam, em sequência, contra a API e a infraestrutura reais.
+
 ## Exemplos de chamadas (curl)
 
 Com um token de `internal-service` em `$TOKEN` (veja acima) e a API em `http://localhost:8080`:
