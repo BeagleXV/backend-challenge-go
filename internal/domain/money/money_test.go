@@ -88,6 +88,37 @@ func TestParseExternalAmount_AcceptsZeroAndPositive(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestParseExternalAmount_PropagatesInvalidAmountError(t *testing.T) {
+	_, err := money.ParseExternalAmount("not-a-number", money.BRL)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, money.ErrInvalidMoney), "must surface New's own parse error, not a generic one")
+}
+
+func TestParseExternalAmount_PropagatesUnsupportedCurrencyError(t *testing.T) {
+	_, err := money.ParseExternalAmount("10.00", money.Currency("XXX"))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, money.ErrUnsupportedCurrency))
+}
+
+func TestZero_RejectsUnsupportedCurrency(t *testing.T) {
+	_, err := money.Zero(money.Currency("XXX"))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, money.ErrUnsupportedCurrency))
+}
+
+func TestZero_ValidCurrency(t *testing.T) {
+	z, err := money.Zero(money.USD)
+	require.NoError(t, err)
+	assert.True(t, z.IsZero())
+	assert.Equal(t, money.USD, z.Currency())
+}
+
+func TestFromMinorUnits_RejectsUnsupportedCurrency(t *testing.T) {
+	_, err := money.FromMinorUnits(100, money.Currency("XXX"))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, money.ErrUnsupportedCurrency))
+}
+
 func TestAdd_Sub_Negate(t *testing.T) {
 	a, err := money.New("10.00", money.BRL)
 	require.NoError(t, err)

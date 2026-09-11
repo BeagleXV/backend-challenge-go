@@ -50,6 +50,51 @@ func TestNew_RejectsNegativeInitialBalance(t *testing.T) {
 	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
 }
 
+func TestNew_RejectsMissingIDOrPlayerID(t *testing.T) {
+	_, err := wallet.New(wallet.NewParams{
+		ID:             uuid.Nil,
+		PlayerID:       uuid.New(),
+		Currency:       money.BRL,
+		InitialBalance: mustMoney(t, "10.00", money.BRL),
+		Now:            time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
+
+	_, err = wallet.New(wallet.NewParams{
+		ID:             uuid.New(),
+		PlayerID:       uuid.Nil,
+		Currency:       money.BRL,
+		InitialBalance: mustMoney(t, "10.00", money.BRL),
+		Now:            time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
+}
+
+func TestNew_RejectsUnsupportedCurrency(t *testing.T) {
+	_, err := wallet.New(wallet.NewParams{
+		ID:             uuid.New(),
+		PlayerID:       uuid.New(),
+		Currency:       money.Currency("XXX"),
+		InitialBalance: mustMoney(t, "10.00", money.BRL),
+		Now:            time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
+}
+
+func TestNew_RejectsZeroNow(t *testing.T) {
+	_, err := wallet.New(wallet.NewParams{
+		ID:             uuid.New(),
+		PlayerID:       uuid.New(),
+		Currency:       money.BRL,
+		InitialBalance: mustMoney(t, "10.00", money.BRL),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
+}
+
 func TestNew_RejectsCurrencyMismatch(t *testing.T) {
 	_, err := wallet.New(wallet.NewParams{
 		ID:             uuid.New(),
@@ -166,4 +211,60 @@ func TestRehydrate_RejectsNegativeBalance(t *testing.T) {
 		UpdatedAt: time.Now(),
 	})
 	require.Error(t, err)
+}
+
+func TestRehydrate_RejectsMissingIDOrPlayerID(t *testing.T) {
+	_, err := wallet.Rehydrate(wallet.RehydrateParams{
+		ID:        uuid.Nil,
+		PlayerID:  uuid.New(),
+		Currency:  money.BRL,
+		Balance:   mustMoney(t, "10.00", money.BRL),
+		Version:   1,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
+}
+
+func TestRehydrate_RejectsUnsupportedCurrency(t *testing.T) {
+	_, err := wallet.Rehydrate(wallet.RehydrateParams{
+		ID:        uuid.New(),
+		PlayerID:  uuid.New(),
+		Currency:  money.Currency("XXX"),
+		Balance:   mustMoney(t, "10.00", money.BRL),
+		Version:   1,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
+}
+
+func TestRehydrate_RejectsCurrencyMismatch(t *testing.T) {
+	_, err := wallet.Rehydrate(wallet.RehydrateParams{
+		ID:        uuid.New(),
+		PlayerID:  uuid.New(),
+		Currency:  money.BRL,
+		Balance:   mustMoney(t, "10.00", money.USD),
+		Version:   1,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrCurrencyMismatch))
+}
+
+func TestRehydrate_RejectsVersionBelowOne(t *testing.T) {
+	_, err := wallet.Rehydrate(wallet.RehydrateParams{
+		ID:        uuid.New(),
+		PlayerID:  uuid.New(),
+		Currency:  money.BRL,
+		Balance:   mustMoney(t, "10.00", money.BRL),
+		Version:   0,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wallet.ErrInvalidWallet))
 }
