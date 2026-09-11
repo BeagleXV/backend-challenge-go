@@ -248,7 +248,22 @@ Todo evento de domínio (`WagerTransactionProcessed`, `WagerTransactionRejected`
 - Integração contra LocalStack real via testcontainers (`internal/adapters/outboxpublisher/sqspublisher_integration_test.go`, build tag `integration`): `SQSPublisher.Publish` entrega numa fila FIFO real com `MessageGroupId`/`MessageDeduplicationId` corretos; republicar o mesmo `eventId` é aceito sem erro e absorvido pela deduplicação nativa do SQS FIFO (nenhuma segunda mensagem chega a ser entregável).
 - Manual, processo real contra Postgres+Keycloak+LocalStack (`docker compose up`, ver histórico de sessão): ao subir o publisher, eventos represados de sessões anteriores (commitados quando ainda não existia publisher algum) foram entregues no primeiro ciclo — `WagerTransactionProcessed`, `WalletBalanceChanged`, `WagerTransactionRejected` e `WagerTransactionPendingReference` todos observados na fila real, com `MessageGroupId` = `aggregateId` e `MessageDeduplicationId` = `eventId` conferidos via `receive-message`; `SIGTERM` parou o publisher antes do worker de referências e do consumidor SQS, depois do listener HTTP — ordem confirmada nos logs do `fx`.
 
-## 12. Uber Fx e shutdown
+## 12. Reconciliação
+
+**O bug que esta fase corrige:** `reconciliation.Service.Reconcile` faz duas leituras — o saldo armazenado da carteira, depois o ledger inteiro — e compara as duas. Sob o isolamento padrão do Postgres (READ COMMITTED, usado por `UnitOfWork.WithinTx` e por todo outro caso de uso deste sistema), cada instrução dentro de uma transação enxerga o estado mais recente já commitado **no momento em que ela roda** — não um snapshot único para a transação inteira. Se um `BET` for commitado entre a primeira leitura (saldo) e a segunda (ledger), a primeira reflete o saldo antigo e a segunda já inclui o novo lançamento: a comparação acusa uma divergência que nunca existiu de verdade, um artefato puro de timing, não um problema financeiro real.
+
+**A correção:** `ports.UnitOfWork` ganhou `WithinRepeatableReadTx`, implementado em `internal/adapters/postgres/unitofwork.go` via `pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})`. Sob REPEATABLE READ, o snapshot é fixado na primeira instrução da transação e vale para todas as instruções seguintes, não importa quanto tempo depois rodem nem quantos commits concorrentes aconteçam nesse meio-tempo — as duas leituras de `Reconcile` sempre observam exatamente o mesmo instante lógico do banco. `AccessMode: pgx.ReadOnly` é defesa em profundidade: o próprio Postgres rejeita qualquer tentativa de escrita nessa transação, então um bug futuro que tentasse mutar algo dentro de `Reconcile` falharia alto e explicitamente, não silenciosamente. `reconciliation.Service` é o único chamador de `WithinRepeatableReadTx` — todo outro caso de uso continua em `WithinTx`/READ COMMITTED, que é o nível certo para eles (cada um só faz uma leitura relevante seguida de escritas na mesma linha já travada por `GetForUpdate`).
+
+**Efeito colateral zero:** o endpoint continua somente leitura — `Reconcile` nunca chama `Update`/`Append`, e agora isso é impossível de contornar por acidente (rejeitado pelo `AccessMode: pgx.ReadOnly`).
+
+**Divergência: log estruturado agora, métrica dedicada na Fase 13.** `internal/adapters/httpapi/handlers_wallet.go` já loga `reconciliation_divergence` (nível `Warn`, com `walletId`/saldo armazenado/calculado/diferença) desde a Fase 6, sempre que `!result.Consistent`. Um contador OpenTelemetry dedicado fica para a Fase 13, quando o SDK de métricas é montado pela primeira vez — construir o meter provider inteiro agora, só para uma métrica, seria retrabalho descartável assim que a Fase 13 chegasse.
+
+**Testado (Postgres real, prova e contraprova lado a lado):**
+- `TestReconciliation_RepeatableRead_ConsistentSnapshotDespiteConcurrentWrite`: reproduz manualmente a intercalação exata (lê saldo → pausa → concorrente commita um `BET` real → lê ledger) através de `WithinRepeatableReadTx`, e confirma que ambas as leituras vêm de antes do `BET` — saldo e soma do ledger batem em 1000.00, sem nenhuma divergência espúria — enquanto uma leitura comum, fora de qualquer transação, confirma que o `BET` realmente aconteceu (saldo real já em 900.00).
+- `TestReadCommitted_SameInterleaving_ProducesSpuriousDivergence`: contraprova — a mesma intercalação exata, mas via `WithinTx` comum (READ COMMITTED) de propósito, reproduz o bug: a leitura do saldo fica em 1000.00 (antes do `BET`), mas a leitura do ledger já enxerga a nova entrada (2 lançamentos em vez de 1) — exatamente o cenário que faria `Reconcile` reportar uma diferença de 100.00 numa carteira perfeitamente saudável. Essa prova negativa é o que demonstra que `WithinRepeatableReadTx` é estrutural, não uma cautela redundante.
+- Manual, processo real (`docker compose up`, ver histórico de sessão): abertura de carteira + `BET` + `POST /wallets/:id/reconciliation` via HTTP, `consistent: true`, `difference: 0.00` — o endpoint funciona identicamente após a troca de isolamento, como esperado (a mudança é invisível ao contrato externo).
+
+## 13. Uber Fx e shutdown
 
 Um `fx.Module` por camada, em `internal/fxmodules/`, agregados por `All(cfg)` e consumidos por `cmd/api/main.go`:
 
@@ -268,10 +283,10 @@ Um `fx.Module` por camada, em `internal/fxmodules/`, agregados por `All(cfg)` e 
 
 Domínio (`internal/domain/**`) confirmado sem nenhum import de `go.uber.org/fx`.
 
-## 13. Observabilidade
+## 14. Observabilidade
 
 *A ser detalhado: o que é logado, quais métricas existem e o que cada uma mede.*
 
-## 14. Limitações e trabalho não concluído
+## 15. Limitações e trabalho não concluído
 
 *A ser detalhado ao final: interpretações adotadas, escopo deliberadamente reduzido, itens não concluídos.*
