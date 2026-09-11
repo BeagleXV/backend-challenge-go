@@ -19,13 +19,15 @@ func lookupFrom(env map[string]string) config.LookupFunc {
 
 func validEnv() map[string]string {
 	return map[string]string{
-		"POSTGRES_HOST":     "localhost",
-		"POSTGRES_PORT":     "5432",
-		"POSTGRES_DB":       "wagering",
-		"POSTGRES_USER":     "wagering_app",
-		"POSTGRES_PASSWORD": "s3cret",
-		"OIDC_ISSUER_URL":   "http://localhost:8081/realms/wagering",
-		"OIDC_AUDIENCE":     "wagering-api",
+		"POSTGRES_HOST":                    "localhost",
+		"POSTGRES_PORT":                    "5432",
+		"POSTGRES_DB":                      "wagering",
+		"POSTGRES_USER":                    "wagering_app",
+		"POSTGRES_PASSWORD":                "s3cret",
+		"OIDC_ISSUER_URL":                  "http://localhost:8081/realms/wagering",
+		"OIDC_AUDIENCE":                    "wagering-api",
+		"AWS_REGION":                       "us-east-1",
+		"SQS_WAGER_TRANSACTIONS_QUEUE_URL": "http://localhost:4566/000000000000/wager-transactions.fifo",
 	}
 }
 
@@ -42,7 +44,7 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 }
 
 func TestLoad_MissingRequiredField_FailsFast(t *testing.T) {
-	for _, key := range []string{"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "OIDC_ISSUER_URL", "OIDC_AUDIENCE"} {
+	for _, key := range []string{"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "OIDC_ISSUER_URL", "OIDC_AUDIENCE", "AWS_REGION", "SQS_WAGER_TRANSACTIONS_QUEUE_URL"} {
 		t.Run(key, func(t *testing.T) {
 			env := validEnv()
 			delete(env, key)

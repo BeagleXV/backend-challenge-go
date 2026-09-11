@@ -48,9 +48,23 @@ type OIDC struct {
 	Audience  string
 }
 
-// Config is every setting the process needs at startup. Fields belonging to
-// layers not wired yet (SQS) are added by the phase that wires them, not
-// speculatively here.
+// SQS carries the settings needed to reach the wager-transactions queue.
+// AccessKeyID/SecretAccessKey/Endpoint are all optional: unset, the AWS
+// SDK falls back to its default credential chain (IAM role, shared config,
+// env vars it reads itself) and the real AWS endpoint for Region — exactly
+// what a real deployment wants. Set, they point the client at LocalStack
+// with its static test credentials for local development. Either way,
+// credentials only ever come from config/environment, never a literal in
+// source.
+type SQS struct {
+	Region                    string
+	Endpoint                  string
+	AccessKeyID               string
+	SecretAccessKey           string
+	WagerTransactionsQueueURL string
+}
+
+// Config is every setting the process needs at startup.
 type Config struct {
 	AppEnv          string
 	ShutdownTimeout time.Duration
@@ -58,6 +72,7 @@ type Config struct {
 	HTTPAddr        string
 	Postgres        Postgres
 	OIDC            OIDC
+	SQS             SQS
 }
 
 // LookupFunc matches os.LookupEnv's signature, so tests can supply a fake
@@ -93,7 +108,31 @@ func Load(lookup LookupFunc) (*Config, error) {
 	}
 	cfg.OIDC = oidcCfg
 
+	sqsCfg, err := loadSQS(lookup)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SQS = sqsCfg
+
 	return cfg, nil
+}
+
+func loadSQS(lookup LookupFunc) (SQS, error) {
+	region, err := require(lookup, "AWS_REGION")
+	if err != nil {
+		return SQS{}, err
+	}
+	queueURL, err := require(lookup, "SQS_WAGER_TRANSACTIONS_QUEUE_URL")
+	if err != nil {
+		return SQS{}, err
+	}
+	return SQS{
+		Region:                    region,
+		Endpoint:                  getOr(lookup, "SQS_ENDPOINT", ""),
+		AccessKeyID:               getOr(lookup, "AWS_ACCESS_KEY_ID", ""),
+		SecretAccessKey:           getOr(lookup, "AWS_SECRET_ACCESS_KEY", ""),
+		WagerTransactionsQueueURL: queueURL,
+	}, nil
 }
 
 func loadOIDC(lookup LookupFunc) (OIDC, error) {
