@@ -193,7 +193,7 @@ func TestTransitions_ValidPaths(t *testing.T) {
 
 	t.Run("PENDING to PENDING_REFERENCE to PROCESSED", func(t *testing.T) {
 		tx := newPendingTx(t)
-		require.NoError(t, tx.MarkPendingReference(time.Now()))
+		require.NoError(t, tx.MarkPendingReference(time.Now(), time.Now().Add(time.Minute)))
 		require.Equal(t, wagertransaction.StatusPendingReference, tx.Status())
 		require.NoError(t, tx.MarkProcessed(time.Now()))
 		require.Equal(t, wagertransaction.StatusProcessed, tx.Status())
@@ -201,7 +201,7 @@ func TestTransitions_ValidPaths(t *testing.T) {
 
 	t.Run("PENDING_REFERENCE to REJECTED", func(t *testing.T) {
 		tx := newPendingTx(t)
-		require.NoError(t, tx.MarkPendingReference(time.Now()))
+		require.NoError(t, tx.MarkPendingReference(time.Now(), time.Now().Add(time.Minute)))
 		require.NoError(t, tx.MarkRejected("REFERENCE_NOT_FOUND", time.Now()))
 		require.Equal(t, wagertransaction.StatusRejected, tx.Status())
 	})
@@ -235,7 +235,7 @@ func TestTransitions_TerminalStatesRejectFurtherTransitions(t *testing.T) {
 			require.Error(t, err)
 			require.True(t, errors.Is(err, wagertransaction.ErrInvalidTransition))
 
-			err = tx.MarkPendingReference(time.Now())
+			err = tx.MarkPendingReference(time.Now(), time.Now().Add(time.Minute))
 			require.Error(t, err)
 			require.True(t, errors.Is(err, wagertransaction.ErrInvalidTransition))
 		})
@@ -244,10 +244,56 @@ func TestTransitions_TerminalStatesRejectFurtherTransitions(t *testing.T) {
 
 func TestTransitions_InvalidDirectPendingReferenceToPendingReference(t *testing.T) {
 	tx := newPendingTx(t)
-	require.NoError(t, tx.MarkPendingReference(time.Now()))
-	err := tx.MarkPendingReference(time.Now())
+	require.NoError(t, tx.MarkPendingReference(time.Now(), time.Now().Add(time.Minute)))
+	err := tx.MarkPendingReference(time.Now(), time.Now().Add(time.Minute))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, wagertransaction.ErrInvalidTransition))
+}
+
+func TestMarkPendingReference_SetsAttemptOneAndNextAttemptAt(t *testing.T) {
+	tx := newPendingTx(t)
+	now := time.Now()
+	next := now.Add(30 * time.Second)
+	require.NoError(t, tx.MarkPendingReference(now, next))
+
+	require.Equal(t, 1, tx.PendingReferenceAttempts())
+	got, ok := tx.PendingReferenceNextAttemptAt()
+	require.True(t, ok)
+	require.True(t, got.Equal(next))
+}
+
+func TestRecordPendingReferenceRetry_IncrementsAttemptsWithoutChangingStatus(t *testing.T) {
+	tx := newPendingTx(t)
+	now := time.Now()
+	require.NoError(t, tx.MarkPendingReference(now, now.Add(30*time.Second)))
+
+	retryAt := now.Add(60 * time.Second)
+	require.NoError(t, tx.RecordPendingReferenceRetry(now, retryAt))
+
+	require.Equal(t, wagertransaction.StatusPendingReference, tx.Status())
+	require.Equal(t, 2, tx.PendingReferenceAttempts())
+	got, ok := tx.PendingReferenceNextAttemptAt()
+	require.True(t, ok)
+	require.True(t, got.Equal(retryAt))
+}
+
+func TestRecordPendingReferenceRetry_RequiresPendingReferenceStatus(t *testing.T) {
+	tx := newPendingTx(t)
+	now := time.Now()
+	err := tx.RecordPendingReferenceRetry(now, now.Add(time.Minute))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidTransition))
+}
+
+func TestTransitionOutOfPendingReference_ClearsNextAttemptAt(t *testing.T) {
+	tx := newPendingTx(t)
+	now := time.Now()
+	require.NoError(t, tx.MarkPendingReference(now, now.Add(30*time.Second)))
+	require.NoError(t, tx.MarkRejected("REFERENCE_NOT_FOUND", now))
+
+	_, ok := tx.PendingReferenceNextAttemptAt()
+	require.False(t, ok, "next attempt must be cleared once the transaction leaves PENDING_REFERENCE")
+	require.Equal(t, 1, tx.PendingReferenceAttempts(), "attempts is a historical record, never reset")
 }
 
 func TestMarkRejected_RequiresFailureCode(t *testing.T) {

@@ -118,6 +118,18 @@ type WagerTransaction struct {
 	// wallet's current balance, which may have moved since.
 	resultBalance *money.Money
 
+	// pendingReferenceAttempts and pendingReferenceNextAttemptAt track the
+	// pending-reference worker's (Fase 10) retry schedule. Both are only
+	// meaningful while status is PENDING_REFERENCE — transitioning to any
+	// other status clears pendingReferenceNextAttemptAt (see
+	// transitionTo), matching the schema's own CHECK constraint that the
+	// column is non-NULL exactly when status = 'PENDING_REFERENCE'.
+	// pendingReferenceAttempts is never reset once set: it stays as a
+	// historical record of how many resolution attempts were made even
+	// after the transaction reaches a terminal state.
+	pendingReferenceAttempts      int
+	pendingReferenceNextAttemptAt *time.Time
+
 	createdAt time.Time
 	updatedAt time.Time
 }
@@ -142,6 +154,17 @@ func (t *WagerTransaction) PlayerID() uuid.UUID            { return t.playerID }
 func (t *WagerTransaction) Amount() money.Money            { return t.amount }
 func (t *WagerTransaction) CreatedAt() time.Time           { return t.createdAt }
 func (t *WagerTransaction) UpdatedAt() time.Time           { return t.updatedAt }
+func (t *WagerTransaction) PendingReferenceAttempts() int  { return t.pendingReferenceAttempts }
+
+// PendingReferenceNextAttemptAt returns when the pending-reference worker
+// should next retry resolving this transaction, and whether one is set
+// (only ever true while status is PENDING_REFERENCE).
+func (t *WagerTransaction) PendingReferenceNextAttemptAt() (time.Time, bool) {
+	if t.pendingReferenceNextAttemptAt == nil {
+		return time.Time{}, false
+	}
+	return *t.pendingReferenceNextAttemptAt, true
+}
 
 // ResultBalance returns the wallet balance snapshot recorded when this
 // transaction was finalized, and whether one was ever recorded (it never is
@@ -309,6 +332,8 @@ type RehydrateParams struct {
 	PlayerID                       uuid.UUID
 	Amount                         money.Money
 	ResultBalance                  *money.Money
+	PendingReferenceAttempts       int
+	PendingReferenceNextAttemptAt  *time.Time
 	CreatedAt                      time.Time
 	UpdatedAt                      time.Time
 }
@@ -337,6 +362,8 @@ func Rehydrate(p RehydrateParams) (*WagerTransaction, error) {
 		playerID:                       p.PlayerID,
 		amount:                         p.Amount,
 		resultBalance:                  p.ResultBalance,
+		pendingReferenceAttempts:       p.PendingReferenceAttempts,
+		pendingReferenceNextAttemptAt:  p.PendingReferenceNextAttemptAt,
 		createdAt:                      p.CreatedAt,
 		updatedAt:                      p.UpdatedAt,
 	}, nil
@@ -352,13 +379,44 @@ func (t *WagerTransaction) transitionTo(next Status, now time.Time) error {
 	}
 	t.status = next
 	t.updatedAt = now
+	if next != StatusPendingReference {
+		// The schema requires this column to be non-NULL exactly when
+		// status = 'PENDING_REFERENCE' — clearing it here keeps that
+		// invariant true by construction on every transition out.
+		t.pendingReferenceNextAttemptAt = nil
+	}
 	return nil
 }
 
 // MarkPendingReference transitions PENDING -> PENDING_REFERENCE, used when
-// processing depends on a reference that has not arrived yet.
-func (t *WagerTransaction) MarkPendingReference(now time.Time) error {
-	return t.transitionTo(StatusPendingReference, now)
+// processing depends on a reference that has not arrived yet. This is
+// always the *first* pending-reference attempt (attempts starts at 1);
+// every attempt after this one is a retry — see
+// RecordPendingReferenceRetry. nextAttemptAt schedules when the
+// pending-reference worker (Fase 10) should first try to resolve this
+// transaction.
+func (t *WagerTransaction) MarkPendingReference(now, nextAttemptAt time.Time) error {
+	if err := t.transitionTo(StatusPendingReference, now); err != nil {
+		return err
+	}
+	t.pendingReferenceAttempts = 1
+	t.pendingReferenceNextAttemptAt = &nextAttemptAt
+	return nil
+}
+
+// RecordPendingReferenceRetry bumps the attempt counter and reschedules
+// the next attempt, without changing status. Unlike MarkPendingReference,
+// this is not a state transition — the transaction is already
+// PENDING_REFERENCE, and stays there; only the pending-reference worker,
+// after another attempt still found nothing resolvable, calls this.
+func (t *WagerTransaction) RecordPendingReferenceRetry(now, nextAttemptAt time.Time) error {
+	if t.status != StatusPendingReference {
+		return fmt.Errorf("%w: %s is not %s", ErrInvalidTransition, t.status, StatusPendingReference)
+	}
+	t.pendingReferenceAttempts++
+	t.pendingReferenceNextAttemptAt = &nextAttemptAt
+	t.updatedAt = now
+	return nil
 }
 
 // MarkProcessed transitions to the PROCESSED terminal state.
