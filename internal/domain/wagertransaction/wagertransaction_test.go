@@ -102,6 +102,52 @@ func TestNewExternal_RequiresProviderMetadata(t *testing.T) {
 	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
 }
 
+func TestNewExternal_RequiresIdentifiers(t *testing.T) {
+	cases := map[string]func(p *wagertransaction.NewExternalParams){
+		"id":       func(p *wagertransaction.NewExternalParams) { p.ID = uuid.Nil },
+		"walletID": func(p *wagertransaction.NewExternalParams) { p.WalletID = uuid.Nil },
+		"playerID": func(p *wagertransaction.NewExternalParams) { p.PlayerID = uuid.Nil },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := baseExternalParams(t, wagertransaction.KindBet, "25.00")
+			mutate(&p)
+			_, err := wagertransaction.NewExternal(p)
+			require.Error(t, err)
+			require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+		})
+	}
+}
+
+func TestNewExternal_RequiresRoundAndGameID(t *testing.T) {
+	p := baseExternalParams(t, wagertransaction.KindBet, "25.00")
+	p.RoundID = ""
+	_, err := wagertransaction.NewExternal(p)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+
+	p = baseExternalParams(t, wagertransaction.KindBet, "25.00")
+	p.GameID = ""
+	_, err = wagertransaction.NewExternal(p)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+}
+
+func TestNewExternal_RequiresNow(t *testing.T) {
+	p := baseExternalParams(t, wagertransaction.KindBet, "25.00")
+	p.Now = time.Time{}
+	_, err := wagertransaction.NewExternal(p)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+}
+
+func TestNewExternal_RejectsUnknownKind(t *testing.T) {
+	p := baseExternalParams(t, wagertransaction.Kind("SOMETHING_ELSE"), "25.00")
+	_, err := wagertransaction.NewExternal(p)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidKind))
+}
+
 func TestNewExternal_StartsInPending(t *testing.T) {
 	p := baseExternalParams(t, wagertransaction.KindBet, "25.00")
 	tx, err := wagertransaction.NewExternal(p)
@@ -142,6 +188,50 @@ func TestNewInternalOpening_RejectsNegative(t *testing.T) {
 		Now:      time.Now(),
 	})
 	require.Error(t, err)
+}
+
+func TestNewInternalOpening_RequiresIdentifiers(t *testing.T) {
+	cases := map[string]wagertransaction.NewInternalOpeningParams{
+		"id": {
+			ID:       uuid.Nil,
+			WalletID: uuid.New(),
+			PlayerID: uuid.New(),
+			Amount:   mustMoney(t, "10.00"),
+			Now:      time.Now(),
+		},
+		"walletID": {
+			ID:       uuid.New(),
+			WalletID: uuid.Nil,
+			PlayerID: uuid.New(),
+			Amount:   mustMoney(t, "10.00"),
+			Now:      time.Now(),
+		},
+		"playerID": {
+			ID:       uuid.New(),
+			WalletID: uuid.New(),
+			PlayerID: uuid.Nil,
+			Amount:   mustMoney(t, "10.00"),
+			Now:      time.Now(),
+		},
+	}
+	for name, params := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := wagertransaction.NewInternalOpening(params)
+			require.Error(t, err)
+			require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+		})
+	}
+}
+
+func TestNewInternalOpening_RequiresNow(t *testing.T) {
+	_, err := wagertransaction.NewInternalOpening(wagertransaction.NewInternalOpeningParams{
+		ID:       uuid.New(),
+		WalletID: uuid.New(),
+		PlayerID: uuid.New(),
+		Amount:   mustMoney(t, "10.00"),
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
 }
 
 func TestInternalOpening_HasNoExternalMetadata(t *testing.T) {
@@ -303,11 +393,35 @@ func TestMarkRejected_RequiresFailureCode(t *testing.T) {
 	require.True(t, errors.Is(err, wagertransaction.ErrFailureCodeRequired))
 }
 
+func TestMarkFailed_RequiresFailureCode(t *testing.T) {
+	tx := newPendingTx(t)
+	err := tx.MarkFailed("", time.Now())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrFailureCodeRequired))
+}
+
+func TestMarkFailed_TransitionsToFailed(t *testing.T) {
+	tx := newPendingTx(t)
+	require.NoError(t, tx.MarkFailed("INFRA_ERROR", time.Now()))
+	require.Equal(t, wagertransaction.StatusFailed, tx.Status())
+}
+
 func TestResolveReference_OnlyForReversals(t *testing.T) {
 	tx := newPendingTx(t) // a BET
 	err := tx.ResolveReference(uuid.New(), time.Now())
 	require.Error(t, err)
 	require.True(t, errors.Is(err, wagertransaction.ErrReferenceNotApplicable))
+}
+
+func TestResolveReference_RejectsNilResolvedID(t *testing.T) {
+	p := baseExternalParams(t, wagertransaction.KindRefund, "25.00")
+	p.ReferenceExternalTransactionID = "bet-1"
+	tx, err := wagertransaction.NewExternal(p)
+	require.NoError(t, err)
+
+	err = tx.ResolveReference(uuid.Nil, time.Now())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
 }
 
 func TestResolveReference_ForRefund(t *testing.T) {
@@ -339,6 +453,38 @@ func TestRehydrate_PreservesTerminalStateWithoutValidation(t *testing.T) {
 	// rehydrated terminal state still rejects new transitions
 	err = tx.MarkProcessed(time.Now())
 	require.Error(t, err)
+}
+
+func TestRehydrate_RequiresIdentifiers(t *testing.T) {
+	base := wagertransaction.RehydrateParams{
+		ID:        uuid.New(),
+		Origin:    wagertransaction.OriginExternal,
+		Kind:      wagertransaction.KindBet,
+		Status:    wagertransaction.StatusProcessed,
+		WalletID:  uuid.New(),
+		PlayerID:  uuid.New(),
+		Amount:    mustMoney(t, "25.00"),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	missingID := base
+	missingID.ID = uuid.Nil
+	_, err := wagertransaction.Rehydrate(missingID)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+
+	missingWalletID := base
+	missingWalletID.WalletID = uuid.Nil
+	_, err = wagertransaction.Rehydrate(missingWalletID)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
+
+	missingPlayerID := base
+	missingPlayerID.PlayerID = uuid.Nil
+	_, err = wagertransaction.Rehydrate(missingPlayerID)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, wagertransaction.ErrInvalidWagerTransaction))
 }
 
 func TestResultBalance_UnsetByDefault(t *testing.T) {
